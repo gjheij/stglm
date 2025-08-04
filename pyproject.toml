@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stglm"
+dynamic = ["version"]
+description = "stglm: single-trial beta estimation following HALFpipe workflows "
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Jurjen Heij", email = "jurjenheij@gmail.com" }]
+maintainers = [{ name = "Jurjen Heij", email = "jurjenheij@gmail.com" }]
+keywords = ["neuroimaging", "preprocessing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Topic :: Scientific/Engineering",
+]
+requires-python = ">=3.8"
+
+dependencies = [
+    "nipype",
+    "niworkflows",
+    "pybids",
+    "matplotlib",
+    "nibabel",
+    "scikit-learn",
+    "numpy",
+    "typing",
+    "configparser",
+    "future",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "flake8"]
+
+[tool.setuptools_scm]
+write_to = "stglm/version.py"
+
+[tool.setuptools.packages.find]
+include = ["stglm*"]
+
