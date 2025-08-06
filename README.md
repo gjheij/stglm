@@ -2,6 +2,8 @@
 
 **stGLM** is a Python-based CLI tool and workflow engine designed to run single-trial GLMs (General Linear Models) on fMRI data using the BIDS standard. It supports LSA (Least Squares All) and LSS (Least Squares Separate) approaches to model trial-specific brain responses.
 
+![plot](https://github.com/gjheij/stglm/blob/main/graph.png)
+
 # Features
 - Run-wise or Concatenated Analysis: Choose between per-run estimation or merged multi-run modeling.
 
