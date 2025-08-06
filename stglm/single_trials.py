@@ -273,6 +273,21 @@ def init_singletrials_wf(
         name='filmgls_lsa',
     )
 
+    def select_trial_betas(in_files, trial_list):
+        # Number of trial regressors
+        n_trials = len(trial_list["TrialList"]) if isinstance(trial_list, dict) else len(trial_list)
+        return in_files[:n_trials]
+
+    # limit to nr of trials
+    pick_lsa = pe.Node(
+        niu.Function(
+            input_names=["in_files", "trial_list"],
+            output_names=["out_files"],
+            function=select_trial_betas
+        ),
+        name="pick_lsa"
+    )
+
     merge_lsa = pe.Node(
         Merge(
             dimension='t',
@@ -531,7 +546,9 @@ def init_singletrials_wf(
         ]),
         (feat_lsa,  film_lsa, [('design_file','design_file')]),
         (inputnode, film_lsa, [('bold','in_file')]),
-        (film_lsa,  merge_lsa,[('param_estimates','in_files')]),
+        (film_lsa,  pick_lsa, [("param_estimates", "in_files")]),
+        (extract_conditions_node, pick_lsa, [("trial_list", "trial_list")]),
+        (pick_lsa,  merge_lsa,[('out_files','in_files')]),
         (feat_lsa,  plot_lsa, [('design_file','design_file')]),
 
         # LSS
