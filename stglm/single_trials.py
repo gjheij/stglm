@@ -11,11 +11,16 @@ import os
 import numpy as np
 from math import isfinite
 from .tsv import FillNA
+from .utils import (
+    generate_and_write_combined_json,
+    bids_filename
+)
 from .conditions import (
     ApplyConditionOffset,
     ParseConditionFile,
 )
-
+from nipype.interfaces.io import DataSink
+from types import SimpleNamespace
 
 def cond_bunch_to_lsa(subject_info):
     from nipype.interfaces.base import Bunch
@@ -127,7 +132,7 @@ def _get_scan_start(vals) -> float:
 
 
 def extract_conditions(subject_info):
-    return {"trial_list": subject_info[0].conditions}
+    return {"TrialList": subject_info[0].conditions}
 
 
 def init_singletrials_wf(
@@ -135,7 +140,7 @@ def init_singletrials_wf(
     feature,
     condition_files,
     condition_units,
-    memcalc=None,
+    derivatives=None
 ):
     """
     Create a workflow that runs GLMsingle then dynamically builds and sinks
@@ -148,12 +153,21 @@ def init_singletrials_wf(
     inputnode = pe.Node(
         niu.IdentityInterface(
             fields=[
-                'tags', 'vals', 'metadata', 'bold', 'mask',
-                'repetition_time', 'confounds_selected',
-                'condition_names', 'condition_files', 'condition_units',
+                'tags',
+                'vals',
+                'metadata',
+                'bold',
+                'mask',
+                'repetition_time',
+                'confounds_selected',
+                'condition_names',
+                'condition_files',
+                'condition_units',
             ]
-        ), name='inputnode'
+        ),
+        name='inputnode'
     )
+
     inputnode.inputs.condition_names = feature.conditions
     inputnode.inputs.condition_files = condition_files
     inputnode.inputs.condition_units = condition_units
@@ -267,7 +281,7 @@ def init_singletrials_wf(
 
     l1_lsa = pe.Node(
         fslm.Level1Design(
-            model_serial_correlations=True,
+            model_serial_correlations=False,
             bases=bases,
         ),
         name='l1design_lsa'
@@ -280,8 +294,7 @@ def init_singletrials_wf(
 
     film_lsa = pe.Node(
         FILMGLS(
-            smooth_autocorr=True,
-            mask_size=5
+            autocorr_noestimate=True
         ),
         name='filmgls_lsa',
     )
@@ -330,7 +343,7 @@ def init_singletrials_wf(
             
     l1_lss = pe.MapNode(
         fslm.Level1Design(
-            model_serial_correlations=True,
+            model_serial_correlations=False,
             bases=bases,
         ),
         iterfield=['session_info'],
@@ -345,8 +358,7 @@ def init_singletrials_wf(
 
     film_lss = pe.MapNode(
         FILMGLS(
-            smooth_autocorr=True,
-            mask_size=5
+            autocorr_noestimate=True
         ),
         iterfield=['design_file'],
         name='filmgls_lss'
@@ -382,15 +394,96 @@ def init_singletrials_wf(
         name='plot_dm_lss'
     )
 
-    # MapNode of MakeResultdicts over each input_dict
-    merge_resultdicts = pe.Node(
-        niu.Merge(2),
-        name="merge_resultdicts"
-    )
-
     # maybe just once in merge_resultdicts?
     if feature is not None:
         cond2lss.inputs.mode = feature.mode
+
+    def format_bids_filenames(tags: dict):
+        """
+        Generate BIDS-style filenames for LSA and LSS outputs.
+        """
+        parts = []
+        for key in ["subject", "session", "task", "run", "space"]:
+            if key in tags:
+                if key in ["subject", "session"]:
+                    kk = key[:3]
+                else:
+                    kk = key
+                    
+                parts.append(f"{kk}-{tags[key]}")
+
+        base = "_".join(parts)
+        return (
+            f"{base}_desc-lsa_betas.nii.gz",
+            f"{base}_desc-lss_betas.nii.gz"
+        )
+
+    # format output names
+    format_bids_names = pe.Node(
+        niu.Function(
+            input_names=["tags"],
+            output_names=["out_lsa", "out_lss"],
+            function=format_bids_filenames  # use the full function, not lambda
+        ),
+        name="format_bids_names"
+    )
+    
+    rename_lsa = pe.Node(niu.Rename(), name="rename_lsa")
+    rename_lss = pe.Node(niu.Rename(), name="rename_lss")
+
+    # datasink
+    if derivatives is None:
+        derivatives = os.path.join(workdir, "derivatives", "stglm")
+
+    # metadata
+    write_metadata = pe.Node(
+        niu.Function(
+            input_names=[
+                "bold", "condition_files", "condition_names",
+                "condition_units", "tags", "vals", "trial_list",
+                "feature_dict", "workdir", "derivatives_dir"
+            ],
+            output_names=["json_path"],
+            function=generate_and_write_combined_json
+        ),
+        name="write_metadata"
+    )
+    write_metadata.inputs.workdir = str(workdir)
+    write_metadata.inputs.derivatives_dir = str(derivatives)
+    write_metadata.inputs.feature_dict = (
+        vars(feature) if isinstance(feature, SimpleNamespace) else feature
+    )
+
+    datasink = pe.Node(
+        DataSink(
+            parameterization=False,
+            base_directory=derivatives
+        ),
+        name="stglm_datasink"
+    )
+
+    def generate_sink_paths(tags):
+        sub_id = tags.get("subject")
+        ses_id = tags.get("session")
+
+        if not sub_id:
+            raise ValueError("Missing subject ID in tags")
+
+        container = f"sub-{sub_id}"
+        if ses_id:
+            container += f"/ses-{ses_id}"
+
+        func_path = "func"
+        return container, func_path
+
+    get_sink_paths = pe.Node(
+        niu.Function(
+            input_names=["tags"],
+            output_names=["container", "func_path"],
+            function=generate_sink_paths
+        ),
+        name="get_sink_paths"
+    )
 
     # Connect the core graph
     workflow.connect([
@@ -398,6 +491,16 @@ def init_singletrials_wf(
         (inputnode, get_scan_start, [('vals','vals')]),
         (inputnode, fillna, [('confounds_selected', 'in_tsv')]),
         (inputnode, merge_metadata_node, [("metadata", "existing_metadata")]),
+        (inputnode, format_bids_names, [("tags", "tags")]),
+        (inputnode, write_metadata, [
+            ("bold", "bold"),
+            ("condition_files", "condition_files"),
+            ("condition_names", "condition_names"),
+            ("condition_units", "condition_units"),
+            ("tags", "tags"),
+            ("vals", "vals"),
+        ]),
+        (inputnode, get_sink_paths, [("tags", "tags")]),
 
         # parse conditions
         (inputnode, parse_condition_file, [
@@ -415,10 +518,13 @@ def init_singletrials_wf(
         ]),
         (apply_condition_offset, cond2lsa, [('subject_info', 'subject_info')]),
         (cond2lsa, extract_conditions_node, [("lsa_subject_info", "subject_info")]),
+        (extract_conditions_node, write_metadata, [
+            ("trial_list", "trial_list")
+        ]),
         (cond2lsa,  spec_lsa, [('lsa_subject_info','subject_info')]),
-        (fillna, spec_lsa, [('out_no_header', 'realignment_parameters')]),
+        (fillna, spec_lsa,    [('out_no_header', 'realignment_parameters')]),
         (spec_lsa,  l1_lsa,   [('session_info','session_info')]),
-        (inputnode, l1_lsa, [('repetition_time', 'interscan_interval')]),
+        (inputnode, l1_lsa,   [('repetition_time', 'interscan_interval')]),
         (l1_lsa,    feat_lsa, [
             ('fsf_files','fsf_file'),
             ('ev_files','ev_files')
@@ -439,9 +545,9 @@ def init_singletrials_wf(
         ]),
         (apply_condition_offset, cond2lss, [('subject_info', 'subject_info')]),
         (cond2lss,  spec_lss, [('lss_subject_infos','subject_info')]),
-        (fillna, spec_lss, [('out_no_header', 'realignment_parameters')]),
+        (fillna, spec_lss,    [('out_no_header', 'realignment_parameters')]),
         (spec_lss,  l1_lss,   [('session_info','session_info')]),
-        (inputnode, l1_lss, [('repetition_time', 'interscan_interval')]),
+        (inputnode, l1_lss,   [('repetition_time', 'interscan_interval')]),
         (l1_lss,    feat_lss, [
             ('fsf_files','fsf_file'),
             ('ev_files','ev_files')
@@ -453,8 +559,16 @@ def init_singletrials_wf(
         (feat_lss,  plot_lss, [('design_file','design_file')]),
 
         # populate beta files
-        (merge_lsa, outputnode, [('merged_file', 'betas_lsa')]),
-        (merge_lss, outputnode, [('merged_file', 'betas_lss')]),
+        (merge_lsa, rename_lsa, [("merged_file", "in_file")]),
+        (merge_lss, rename_lss, [("merged_file", "in_file")]),
+        (format_bids_names, rename_lsa, [("out_lsa", "format_string")]),
+        (format_bids_names, rename_lss, [("out_lss", "format_string")]),
+
+        # datasink
+        (get_sink_paths, datasink, [("container", "container")]),
+        (rename_lsa, datasink, [("out_file", "func.@lsa")]),
+        (rename_lss, datasink, [("out_file", "func.@lss")]),
+        (write_metadata, datasink, [("json_path", "func.@json")]),
     ])
 
     return workflow

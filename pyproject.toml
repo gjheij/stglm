@@ -44,3 +44,5 @@ write_to = "stglm/version.py"
 [tool.setuptools.packages.find]
 include = ["stglm*"]
 
+[project.scripts]
+stglm = "stglm.cli:main"

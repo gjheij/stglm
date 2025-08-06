@@ -1,9 +1,9 @@
 # Ignore egg files and directories
 *.egg
 *.egg-info/
-lazyplot/__pycache__/
+stglm/__pycache__/
 *.pyc
 *.pyo
 .DS_Store
-fmriproc/version.py
+stglm/version.py
 build/*

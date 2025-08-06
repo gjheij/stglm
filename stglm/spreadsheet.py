@@ -8,7 +8,6 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-import chardet
 import pandas as pd
 
 from .utils import split_ext
@@ -41,11 +40,7 @@ def read_spreadsheet(file_name: Path | str, extension: str | None = None, **kwar
         bytes_io = io.BytesIO(file_bytes)
         return pd.read_excel(bytes_io, engine="odf", **kwargs)
 
-    encoding = chardet.detect(file_bytes)["encoding"]
-
-    if encoding is None:
-        encoding = "utf8"
-
+    encoding = "utf8"
     kwargs["encoding"] = encoding
 
     file_str = file_bytes.decode(encoding)
