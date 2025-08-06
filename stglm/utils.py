@@ -4,13 +4,9 @@
 
 import pathlib
 import zipfile
-import pandas as pd
+import subprocess
 import nibabel as nb
-from os import path as op
 from pathlib import Path
-from shutil import copyfile
-from typing import Any, Iterator
-from nilearn.image import concat_imgs
 
 AnyPath = pathlib.Path | zipfile.Path
 
@@ -268,3 +264,58 @@ def merge_bold_fsl(bold_files, out_file=None):
     subprocess.run(cmd, check=True)
 
     return str(out_file)
+
+def generate_sanitized_metadata(tags, vals, trial_list, **kwargs):
+    import json
+
+    def safe_val(val):
+        # Convert to serializable types
+        if isinstance(val, (int, float, str, bool, type(None))):
+            return val
+        if isinstance(val, (list, tuple)):
+            return [safe_val(v) for v in val]
+        if isinstance(val, dict):
+            return {str(k): safe_val(v) for k, v in val.items()}
+        # Fallback to string
+        return str(val)
+
+    out = {}
+
+    # Flatten and sanitize tags, vals
+    for d in [tags, vals]:
+        for k, v in d.items():
+            out[str(k)] = safe_val(v)
+
+    # Add TrialList (flatten nested key if needed)
+    if isinstance(trial_list, dict) and "TrialList" in trial_list:
+        out["TrialList"] = safe_val(trial_list["TrialList"])
+    else:
+        out["TrialList"] = safe_val(trial_list)
+
+    # Add other kwargs like Conditions, etc.
+    for k, v in kwargs.items():
+        if k in out:
+            k = f"extra_{k}"  # avoid overwrite
+        out[k] = safe_val(v)
+
+    # Handle special merging for Sources + ConditionFile
+    based_on = out.pop("BasedOn", None)
+    condition_file = out.pop("ConditionFile", None)
+
+    merged_sources = []
+    if condition_file:
+        merged_sources += condition_file if isinstance(condition_file, list) else [condition_file]
+    if based_on:
+        merged_sources += based_on if isinstance(based_on, list) else [based_on]
+
+    if merged_sources:
+        # De-duplicate while preserving order
+        seen = set()
+        merged = []
+        for s in merged_sources:
+            if s not in seen:
+                seen.add(s)
+                merged.append(safe_val(s))
+        out["Sources"] = merged
+
+    return out

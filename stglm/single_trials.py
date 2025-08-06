@@ -11,16 +11,12 @@ import os
 import numpy as np
 from math import isfinite
 from .tsv import FillNA
-from .utils import (
-    generate_and_write_combined_json,
-    bids_filename
-)
+from .utils import generate_sanitized_metadata
 from .conditions import (
     ApplyConditionOffset,
     ParseConditionFile,
 )
-from nipype.interfaces.io import DataSink
-from types import SimpleNamespace
+from nipype.interfaces.io import DataSink, JSONFileSink
 
 def cond_bunch_to_lsa(subject_info):
     from nipype.interfaces.base import Bunch
@@ -235,28 +231,6 @@ def init_singletrials_wf(
         name="extract_conditions"
     )
 
-    def merge_metadata(**kwargs):
-        existing = kwargs.get("existing_metadata") or {}
-        new = kwargs.get("new_metadata") or {}
-
-        if not isinstance(existing, dict):
-            raise TypeError(f"'existing_metadata' must be dict, got {type(existing)}")
-        if not isinstance(new, dict):
-            raise TypeError(f"'new_metadata' must be dict, got {type(new)}")
-
-        merged = existing.copy()
-        merged.update(new)
-        return merged
-    
-    merge_metadata_node = pe.Node(
-        niu.Function(
-            input_names=["existing_metadata", "new_metadata"],
-            output_names=["metadata"],
-            function=merge_metadata
-        ),
-        name="merge_metadata"
-    )
-
     #------------------------------------------------------------------
     # LSA
     cond2lsa = pe.Node(
@@ -415,14 +389,15 @@ def init_singletrials_wf(
         base = "_".join(parts)
         return (
             f"{base}_desc-lsa_betas.nii.gz",
-            f"{base}_desc-lss_betas.nii.gz"
+            f"{base}_desc-lss_betas.nii.gz",
+            f"{base}.json"
         )
 
     # format output names
     format_bids_names = pe.Node(
         niu.Function(
             input_names=["tags"],
-            output_names=["out_lsa", "out_lss"],
+            output_names=["out_lsa", "out_lss", "out_json"],
             function=format_bids_filenames  # use the full function, not lambda
         ),
         name="format_bids_names"
@@ -435,29 +410,58 @@ def init_singletrials_wf(
     if derivatives is None:
         derivatives = os.path.join(workdir, "derivatives", "stglm")
 
+    derivatives = str(derivatives)
+
     # metadata
-    write_metadata = pe.Node(
+    sanitize_metadata = pe.Node(
         niu.Function(
             input_names=[
-                "bold", "condition_files", "condition_names",
-                "condition_units", "tags", "vals", "trial_list",
-                "feature_dict", "workdir", "derivatives_dir"
+                "tags",
+                "vals",
+                "trial_list",
+                "Conditions",
+                "ConditionFile",
+                "ConditionUnits",
+                "BasedOn",
+                "BetasLSA",
+                "BetasLSS"
             ],
-            output_names=["json_path"],
-            function=generate_and_write_combined_json
+            output_names=["metadata"],
+            function=generate_sanitized_metadata
         ),
-        name="write_metadata"
+        name="sanitize_metadata"
     )
-    write_metadata.inputs.workdir = str(workdir)
-    write_metadata.inputs.derivatives_dir = str(derivatives)
-    write_metadata.inputs.feature_dict = (
-        vars(feature) if isinstance(feature, SimpleNamespace) else feature
+
+    def write_metadata_json(in_dict, out_name):
+        import json
+        from pathlib import Path
+
+        # Get the current working directory of the node (runtime dir)
+        cwd = Path.cwd()
+
+        # Define the output path in the node’s directory
+        out_path = cwd / out_name
+
+        # Write JSON with pretty formatting
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(in_dict, f, indent=4, ensure_ascii=False)
+
+        return str(out_path)
+
+    write_json_node = pe.Node(
+        niu.Function(
+            input_names=["in_dict", "out_name"],
+            output_names=["out_file"],
+            function=write_metadata_json
+        ),
+        name="write_json_node"
     )
 
     datasink = pe.Node(
         DataSink(
             parameterization=False,
-            base_directory=derivatives
+            base_directory=str(derivatives),
+            remove_dest_dir=True
         ),
         name="stglm_datasink"
     )
@@ -490,17 +494,16 @@ def init_singletrials_wf(
         # scan start offset
         (inputnode, get_scan_start, [('vals','vals')]),
         (inputnode, fillna, [('confounds_selected', 'in_tsv')]),
-        (inputnode, merge_metadata_node, [("metadata", "existing_metadata")]),
         (inputnode, format_bids_names, [("tags", "tags")]),
-        (inputnode, write_metadata, [
-            ("bold", "bold"),
-            ("condition_files", "condition_files"),
-            ("condition_names", "condition_names"),
-            ("condition_units", "condition_units"),
+        (inputnode, get_sink_paths, [("tags", "tags")]),
+        (inputnode, sanitize_metadata, [
             ("tags", "tags"),
             ("vals", "vals"),
+            ("condition_names", "Conditions"),
+            ("condition_files", "ConditionFile"),
+            ("condition_units", "ConditionUnits"),
+            ("bold", "BasedOn"),
         ]),
-        (inputnode, get_sink_paths, [("tags", "tags")]),
 
         # parse conditions
         (inputnode, parse_condition_file, [
@@ -518,9 +521,6 @@ def init_singletrials_wf(
         ]),
         (apply_condition_offset, cond2lsa, [('subject_info', 'subject_info')]),
         (cond2lsa, extract_conditions_node, [("lsa_subject_info", "subject_info")]),
-        (extract_conditions_node, write_metadata, [
-            ("trial_list", "trial_list")
-        ]),
         (cond2lsa,  spec_lsa, [('lsa_subject_info','subject_info')]),
         (fillna, spec_lsa,    [('out_no_header', 'realignment_parameters')]),
         (spec_lsa,  l1_lsa,   [('session_info','session_info')]),
@@ -533,9 +533,6 @@ def init_singletrials_wf(
         (inputnode, film_lsa, [('bold','in_file')]),
         (film_lsa,  merge_lsa,[('param_estimates','in_files')]),
         (feat_lsa,  plot_lsa, [('design_file','design_file')]),
-
-        # add trial_list to metadata
-        (extract_conditions_node, merge_metadata_node, [("trial_list", "new_metadata")]),
 
         # LSS
         (inputnode, spec_lss, [
@@ -563,12 +560,18 @@ def init_singletrials_wf(
         (merge_lss, rename_lss, [("merged_file", "in_file")]),
         (format_bids_names, rename_lsa, [("out_lsa", "format_string")]),
         (format_bids_names, rename_lss, [("out_lss", "format_string")]),
+        (format_bids_names, write_json_node, [("out_json", "out_name")]),
 
-        # datasink
+        # metadata
+        (extract_conditions_node, sanitize_metadata, [("trial_list", "trial_list")]),
+        (sanitize_metadata, write_json_node, [("metadata", "in_dict")]),
+
+        # datasink      
         (get_sink_paths, datasink, [("container", "container")]),
         (rename_lsa, datasink, [("out_file", "func.@lsa")]),
         (rename_lss, datasink, [("out_file", "func.@lss")]),
-        (write_metadata, datasink, [("json_path", "func.@json")]),
+        (write_json_node, datasink, [("out_file", "func.@json")])
+
     ])
 
     return workflow

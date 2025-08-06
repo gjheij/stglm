@@ -178,7 +178,13 @@ def run_stglm_from_inputs(
                     "n_procs": n_procs
                 }
             }
-        stglm_wf.run(**kwargs)
+
+        try:
+            stglm_wf.run(**kwargs)
+            logger.info("stGLM completed without errors")
+        except Exception as e:
+            raise RuntimeError(f"stGLM failed: {e}")
+        
 
 def args_parser():
 
