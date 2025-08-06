@@ -238,7 +238,7 @@ def merge_events(event_files, bold_files, tr, out_file=None):
     return merged_df
 
 
-def merge_bold_fsl(bold_files, out_file=None):
+def merge_bold(bold_files, out_file=None):
     """
     Merge BOLD files using FSL's fslmerge to avoid memory overload.
 
