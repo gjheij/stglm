@@ -16,7 +16,7 @@ from .conditions import (
     ApplyConditionOffset,
     ParseConditionFile,
 )
-from nipype.interfaces.io import DataSink, JSONFileSink
+from nipype.interfaces.io import DataSink
 
 def cond_bunch_to_lsa(subject_info):
     from nipype.interfaces.base import Bunch
@@ -98,25 +98,6 @@ def cond_bunch_to_lss(subject_info, mode='cond'):
         )
     return out
 
-
-def plot_fsl_design(design_file, png_name=None):
-    import numpy as np, matplotlib.pyplot as plt, os, pathlib
-    rows, start = [], False
-    for line in open(design_file):
-        if line.strip() == '/Matrix': start = True; continue
-        if start:
-            rows.append([float(x) for x in line.split()])
-    X = np.array(rows)
-    if png_name is None:
-        stem = pathlib.Path(design_file).with_suffix('').name
-        png_name = f'{stem}.png'
-    out_png = os.path.abspath(png_name)
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(X, aspect='auto', interpolation='nearest')
-    ax.set_xlabel('Regressors'); ax.set_ylabel('Time points')
-    ax.set_title('FSL Design Matrix'); fig.tight_layout()
-    fig.savefig(out_png, dpi=150); plt.close(fig)
-    return out_png
 
 def pick_roi_betas(param_lists, idx=0):
     # param_lists: list of lists
@@ -296,16 +277,6 @@ def init_singletrials_wf(
         ),
         name='merge_betas_lsa'
     )
-
-    plot_lsa = pe.Node(
-        niu.Function(
-            input_names=['design_file','png_name'],
-            output_names=['out_png'],
-            function=plot_fsl_design
-        ),
-        name='plot_dm_lsa'
-    )
-    plot_lsa.inputs.png_name = 'design_matrix_lsa.png'
     
     #------------------------------------------------------------------
     # LSS
@@ -373,16 +344,6 @@ def init_singletrials_wf(
         name='merge_betas_lss'
     )
 
-    plot_lss = pe.MapNode(
-        niu.Function(
-            input_names=['design_file','png_name'],
-            output_names=['out_png'],
-            function=plot_fsl_design
-        ),
-        iterfield=['design_file'],
-        name='plot_dm_lss'
-    )
-
     # maybe just once in merge_resultdicts?
     if feature is not None:
         cond2lss.inputs.mode = feature.mode
@@ -402,24 +363,31 @@ def init_singletrials_wf(
                 parts.append(f"{kk}-{tags[key]}")
 
         base = "_".join(parts)
-        return (
+        return [
             f"{base}_desc-lsa_betas.nii.gz",
             f"{base}_desc-lss_betas.nii.gz",
-            f"{base}.json"
-        )
+            f"{base}.json",
+            f"{base}_desc-lss_betas.png",
+            f"{base}_desc-lss_betas.mat",
+            f"{base}_desc-lsa_betas.png",
+            f"{base}_desc-lsa_betas.mat",            
+        ]
 
     # format output names
     format_bids_names = pe.Node(
         niu.Function(
             input_names=["tags"],
-            output_names=["out_lsa", "out_lss", "out_json"],
+            output_names=["out_names"],
             function=format_bids_filenames  # use the full function, not lambda
         ),
         name="format_bids_names"
     )
-    
-    rename_lsa = pe.Node(niu.Rename(), name="rename_lsa")
-    rename_lss = pe.Node(niu.Rename(), name="rename_lss")
+
+    rename_outputs  = pe.MapNode(
+        niu.Rename(),
+        name="rename_outputs",
+        iterfield=["in_file", "format_string"]
+    )
 
     # datasink
     if derivatives is None:
@@ -447,7 +415,7 @@ def init_singletrials_wf(
         name="sanitize_metadata"
     )
 
-    def write_metadata_json(in_dict, out_name):
+    def write_metadata_json(in_dict, out_name="metadata.json"):
         import json
         from pathlib import Path
 
@@ -472,11 +440,50 @@ def init_singletrials_wf(
         name="write_json_node"
     )
 
+    def collect_generated_outputs(lsa_file, lss_file, lsa_mat, lsa_png, lss_mat, lss_png, json_file):
+        return [lsa_file, lss_file, json_file, lss_png, lss_mat, lsa_png, lsa_mat]
+
+    generate_outputs = pe.Node(
+        niu.Function(
+            input_names=[
+                "lsa_file",
+                "lss_file",
+                "lsa_mat",
+                "lsa_png",
+                "lss_mat",
+                "lss_png",
+                "json_file"
+            ],
+            output_names=["file_list"],
+            function=collect_generated_outputs
+        ),
+        name="generate_outputs"
+    )
+
+    def split_renamed_outputs(file_list):
+        return tuple(file_list)
+
+    split_outputs = pe.Node(
+        niu.Function(
+            input_names=["file_list"],
+            output_names=[
+                "out_lsa",
+                "out_lss",
+                "out_json",
+                "out_lss_png",
+                "out_lss_mat",
+                "out_lsa_png",
+                "out_lsa_mat"
+            ],
+            function=split_renamed_outputs
+        ),
+        name="split_outputs"
+    )
+
     datasink = pe.Node(
         DataSink(
             parameterization=False,
             base_directory=str(derivatives),
-            remove_dest_dir=True
         ),
         name="stglm_datasink"
     )
@@ -503,6 +510,24 @@ def init_singletrials_wf(
         ),
         name="get_sink_paths"
     )
+
+    select_first_png = pe.Node(
+        niu.Function(
+            input_names=["file_list"],
+            output_names=["first_file"],
+            function=lambda file_list: file_list[0] if file_list else None
+        ),
+        name="select_first_png"
+    )
+
+    select_first_mat = pe.Node(
+        niu.Function(
+            input_names=["file_list"],
+            output_names=["first_file"],
+            function=lambda file_list: file_list[0] if file_list else None
+        ),
+        name="select_first_mat"
+    )    
 
     # Connect the core graph
     workflow.connect([
@@ -549,7 +574,6 @@ def init_singletrials_wf(
         (film_lsa,  pick_lsa, [("param_estimates", "in_files")]),
         (extract_conditions_node, pick_lsa, [("trial_list", "trial_list")]),
         (pick_lsa,  merge_lsa,[('out_files','in_files')]),
-        (feat_lsa,  plot_lsa, [('design_file','design_file')]),
 
         # LSS
         (inputnode, spec_lss, [
@@ -570,25 +594,43 @@ def init_singletrials_wf(
         (inputnode, film_lss, [('bold','in_file')]),
         (film_lss,  pick_lss, [('param_estimates','param_lists')]),
         (pick_lss,  merge_lss,[('roi_betas','in_files')]),
-        (feat_lss,  plot_lss, [('design_file','design_file')]),
-
-        # populate beta files
-        (merge_lsa, rename_lsa, [("merged_file", "in_file")]),
-        (merge_lss, rename_lss, [("merged_file", "in_file")]),
-        (format_bids_names, rename_lsa, [("out_lsa", "format_string")]),
-        (format_bids_names, rename_lss, [("out_lss", "format_string")]),
-        (format_bids_names, write_json_node, [("out_json", "out_name")]),
+        (feat_lss, select_first_png, [("design_image", "file_list")]),
+        (feat_lss, select_first_mat, [("design_file", "file_list")]),
 
         # metadata
         (extract_conditions_node, sanitize_metadata, [("trial_list", "trial_list")]),
         (sanitize_metadata, write_json_node, [("metadata", "in_dict")]),
 
-        # datasink      
+        # generate outputs
+        (merge_lsa, generate_outputs, [("merged_file", "lsa_file")]),
+        (merge_lss, generate_outputs, [("merged_file", "lss_file")]),
+        (write_json_node, generate_outputs, [("out_file", "json_file")]),
+        (feat_lsa, generate_outputs, [("design_file", "lsa_mat")]),
+        (feat_lsa, generate_outputs, [("design_image", "lsa_png")]),
+        (select_first_mat, generate_outputs, [("first_file", "lss_mat")]),
+        (select_first_png, generate_outputs, [("first_file", "lss_png")]),
+
+        # feed into renaming for later DataSink
+        (generate_outputs, rename_outputs, [("file_list", "in_file")]),
+        (format_bids_names, rename_outputs, [("out_names", "format_string")]),
+
+        # split for proper parsing to DataSink
+        (rename_outputs, split_outputs, [("out_file", "file_list")]),
         (get_sink_paths, datasink, [("container", "container")]),
-        (rename_lsa, datasink, [("out_file", "func.@lsa")]),
-        (rename_lss, datasink, [("out_file", "func.@lss")]),
-        (write_json_node, datasink, [("out_file", "func.@json")])
 
     ])
+
+    sink_map = [
+        ("out_lsa", "func.@lsa"),
+        ("out_lss", "func.@lss"),
+        ("out_json", "func.@json"),
+        ("out_lss_png", "func.@lss_png"),
+        ("out_lss_mat", "func.@lss_mat"),
+        ("out_lsa_png", "func.@lsa_png"),
+        ("out_lsa_mat", "func.@lsa_mat"),
+    ]
+
+    for out_field, sink_path in sink_map:
+        workflow.connect(split_outputs, out_field, datasink, sink_path)
 
     return workflow
