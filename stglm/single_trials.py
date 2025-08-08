@@ -3,6 +3,7 @@ from pathlib import Path
 
 import nipype.interfaces.utility as niu
 from nipype.pipeline import engine as pe
+from nipype.interfaces.base import isdefined
 from nipype.interfaces.fsl import model as fslm
 from nipype.interfaces.fsl import FEATModel, FILMGLS, Merge
 import nipype.interfaces.utility as niu
@@ -148,16 +149,6 @@ def init_singletrials_wf(
     inputnode.inputs.condition_names = feature.conditions
     inputnode.inputs.condition_files = condition_files
     inputnode.inputs.condition_units = condition_units
-
-    outputnode = pe.Node(
-        niu.IdentityInterface(
-            fields=[
-                "betas_lsa",
-                "betas_lss"
-            ]
-        ),
-        name="outputnode"
-    )
 
     #------------------------------------------------------------------
     # general
@@ -529,11 +520,18 @@ def init_singletrials_wf(
         name="select_first_mat"
     )    
 
+    # if confound file is specified
+    if isdefined(inputnode.inputs.confounds_selected):
+        workflow.connect([
+            (inputnode, fillna, [('confounds_selected', 'in_tsv')]),
+            (fillna, spec_lsa,  [('out_no_header', 'realignment_parameters')]),
+            (fillna, spec_lss,  [('out_no_header', 'realignment_parameters')]),
+        ])
+
     # Connect the core graph
     workflow.connect([
         # scan start offset
         (inputnode, get_scan_start, [('vals','vals')]),
-        (inputnode, fillna, [('confounds_selected', 'in_tsv')]),
         (inputnode, format_bids_names, [("tags", "tags")]),
         (inputnode, get_sink_paths, [("tags", "tags")]),
         (inputnode, sanitize_metadata, [
@@ -562,7 +560,6 @@ def init_singletrials_wf(
         (apply_condition_offset, cond2lsa, [('subject_info', 'subject_info')]),
         (cond2lsa, extract_conditions_node, [("lsa_subject_info", "subject_info")]),
         (cond2lsa,  spec_lsa, [('lsa_subject_info','subject_info')]),
-        (fillna, spec_lsa,    [('out_no_header', 'realignment_parameters')]),
         (spec_lsa,  l1_lsa,   [('session_info','session_info')]),
         (inputnode, l1_lsa,   [('repetition_time', 'interscan_interval')]),
         (l1_lsa,    feat_lsa, [
@@ -583,7 +580,6 @@ def init_singletrials_wf(
         ]),
         (apply_condition_offset, cond2lss, [('subject_info', 'subject_info')]),
         (cond2lss,  spec_lss, [('lss_subject_infos','subject_info')]),
-        (fillna, spec_lss,    [('out_no_header', 'realignment_parameters')]),
         (spec_lss,  l1_lss,   [('session_info','session_info')]),
         (inputnode, l1_lss,   [('repetition_time', 'interscan_interval')]),
         (l1_lss,    feat_lss, [
@@ -617,7 +613,6 @@ def init_singletrials_wf(
         # split for proper parsing to DataSink
         (rename_outputs, split_outputs, [("out_file", "file_list")]),
         (get_sink_paths, datasink, [("container", "container")]),
-
     ])
 
     sink_map = [

@@ -15,6 +15,7 @@ def build_inputs(
     run_mode="loop",
     task=None,
     desc="masked",
+    no_confounds=False,
     **kwargs
     ):
 
@@ -40,16 +41,19 @@ def build_inputs(
         **kwargs
     )
 
-    confounds = layout.get(
-        subject=subject,
-        task=task,
-        suffix='timeseries',
-        extension='tsv',
-        return_type='file'
-    )
+    if not no_confounds:
+        confounds = layout.get(
+            subject=subject,
+            task=task,
+            suffix='timeseries',
+            extension='tsv',
+            return_type='file'
+        )
 
-    if not confounds:
-        raise FileNotFoundError(f"No confounds found for subject {subject}")
+        if not confounds:
+            raise FileNotFoundError(f"No confounds found for subject {subject}")
+    else:
+        confounds = None
 
     events = layout.get(
         subject=subject,
@@ -67,9 +71,24 @@ def build_inputs(
 
     if run_mode == "concat":
         logger.info(f"Estimation mode = {run_mode}; concatenating all runs")
-        merged_bold = utils.merge_bold([i.path for i in bold_files])
-        merged_confounds = utils.merge_confounds(confounds, out_file="/tmp/merged_confounds.tsv")
-        merged_events = utils.merge_events(events, bold_files, tr, out_file="/tmp/merged_events.tsv")
+        merged_bold = utils.merge_bold(
+            [i.path for i in bold_files]
+        )
+
+        if not no_confounds:
+            merged_confounds = utils.merge_confounds(
+                confounds,
+                out_file="/tmp/merged_confounds.tsv"
+            )
+        else:
+            merged_confounds = None
+
+        merged_events = utils.merge_events(
+            events,
+            bold_files,
+            tr,
+            out_file="/tmp/merged_events.tsv"
+        )
 
         try:
             entities.pop("run")
@@ -92,7 +111,7 @@ def build_inputs(
             all_runs.append({
                 "bold": bold_files[i].path,
                 "mask": mask_files[i] if len(mask_files) > 1 else mask_files[0],
-                "confounds": confounds[i],
+                "confounds": confounds[i] if confounds is not None else None,
                 "events": events[i],
                 "tags": bold_files[i].entities,
                 "tr": tr
@@ -107,7 +126,7 @@ def run_stglm_from_inputs(
     workdir,
     confound_regexes,
     n_procs=1,
-    derivatives=None
+    derivatives=None,
     ):
 
     for run in run_data_list:
@@ -139,18 +158,21 @@ def run_stglm_from_inputs(
             / bold_wf_name
         )
 
-        conf_wf = init_confounds_select_wf()
-        conf_wf.base_dir = workdir_i
+        if run["confounds"] is not None:
+            conf_wf = init_confounds_select_wf()
+            conf_wf.base_dir = workdir_i
 
-        conf_input = conf_wf.get_node("inputnode").inputs
-        conf_input.bold = run["bold"]
-        conf_input.tags = run["tags"]
-        conf_input.mask = run["mask"]
-        conf_input.confounds = run["confounds"]
-        conf_input.confound_names = confound_regexes
+            conf_input = conf_wf.get_node("inputnode").inputs
+            conf_input.bold = run["bold"]
+            conf_input.tags = run["tags"]
+            conf_input.mask = run["mask"]
+            conf_input.confounds = run["confounds"]
+            conf_input.confound_names = confound_regexes
 
-        conf_result = conf_wf.run()
-        conf_tsv = utils.get_node_by_name(conf_result, "selectcolumns").result.outputs.out_with_header
+            conf_result = conf_wf.run()
+            conf_tsv = utils.get_node_by_name(conf_result, "selectcolumns").result.outputs.out_with_header
+        else:
+            conf_tsv = None
 
         # Run single-trials
         stglm_wf = init_singletrials_wf(
@@ -284,6 +306,18 @@ def args_parser():
         help='Number of processes (CPUs) to use (default = 1)'
     )    
 
+    parser.add_argument(
+        '--n-procs',
+        default=1,
+        help='Number of processes (CPUs) to use (default = 1)'
+    )
+
+    parser.add_argument(
+        '--no-confounds',
+        action='store_true',
+        help="Do not use any confounds (assuming input data is already denoised)"
+    ) 
+
     return parser.parse_args()
 
 def main():
@@ -309,6 +343,7 @@ def main():
         run_mode=args.run_mode,
         desc=args.desc,
         task=args.task,
+        no_confounds=args.no_confounds,
         **space_kwargs
     )
 
@@ -325,8 +360,12 @@ def main():
         "Global signal": "global_signal",
     }
 
-    confound_regexes = [confound_options[args.confound_subset]]
-    logger.info(f"Using '{args.confound_subset}' ({confound_regexes}) from confound files")
+    confound_regexes = None
+    if not args.no_confounds:
+        confound_regexes = [confound_options[args.confound_subset]]
+        logger.info(f"Using '{args.confound_subset}' ({confound_regexes}) from confound files")
+    else:
+        logger.info("Not including any confounds; assuming data is already treated properly..")
 
     logger.info(f"Including conditions: {args.evs}")
     ddict = {
