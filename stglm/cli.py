@@ -289,9 +289,9 @@ def args_parser():
 
     parser.add_argument(
         '--desc',
-        choices=['preproc', 'masked'],
+        choices=['preproc', 'masked', 'pybest'],
         default='masked',
-        help="'preproc' refers to the default output from fMRIprep, 'masked' is the skullstripped version using 'call_fprepmask'"
+        help="'preproc' refers to the default output from fMRIprep, 'masked' is the skullstripped version using 'call_fprepmask', 'pybest' is the full output from Pybest"
     )
     
     parser.add_argument(
