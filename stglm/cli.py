@@ -307,12 +307,6 @@ def args_parser():
     )    
 
     parser.add_argument(
-        '--n-procs',
-        default=1,
-        help='Number of processes (CPUs) to use (default = 1)'
-    )
-
-    parser.add_argument(
         '--no-confounds',
         action='store_true',
         help="Do not use any confounds (assuming input data is already denoised)"
