@@ -1,38 +1,103 @@
 # -*- coding: utf-8 -*-
+"""Single-trial task workflow with HALFpipe-style condition-wise beta time series outputs."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from math import isfinite
 from pathlib import Path
 
-import nipype.interfaces.utility as niu
-from nipype.pipeline import engine as pe
-from nipype.interfaces.base import isdefined
-from nipype.interfaces.fsl import model as fslm
-from nipype.interfaces.fsl import FEATModel, FILMGLS, Merge
-import nipype.interfaces.utility as niu
 import nipype.algorithms.modelgen as model
-import os
+import nipype.interfaces.utility as niu
 import numpy as np
-from math import isfinite
-from .tsv import FillNA
-from .utils import generate_sanitized_metadata
-from .conditions import (
-    ApplyConditionOffset,
-    ParseConditionFile,
-)
+from nipype.interfaces.base import isdefined
+from nipype.interfaces.fsl import FEATModel, FILMGLS, Merge
+from nipype.interfaces.fsl import model as fslm
 from nipype.interfaces.io import DataSink
+from nipype.pipeline import engine as pe
+
+from .conditions import ApplyConditionOffset, ParseConditionFile
+from .tsv import FillNA
+
+
+def _get_scan_start(vals) -> float:
+    return float(vals["scan_start"])
+
+
+def _as_bunch(subject_info):
+    """Accept either a Bunch or a singleton list/tuple containing a Bunch."""
+    return subject_info[0] if isinstance(subject_info, (list, tuple)) else subject_info
+
+
+def _trial_digits(n_trials: int) -> int:
+    return max(3, len(str(n_trials)))
+
+
+def _split_trial_condition(condition: str) -> str:
+    """Return the original condition name from a trial-wise regressor name."""
+    if "__" in condition:
+        condition, _ = condition.rsplit("__", 1)
+        return condition
+    condition, _ = condition.rsplit("_", 1)
+    return condition
+
+
+def _safe_entity(value) -> str:
+    """Make a value safe enough for a BIDS-like filename entity."""
+    value = str(value)
+    value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+    return value or "unknown"
+
+
+def _base_bids_name(tags: dict) -> str:
+    parts: list[str] = []
+    for key in ["subject", "session", "task", "run", "space"]:
+        if key in tags and tags[key] not in (None, ""):
+            entity = key[:3] if key in {"subject", "session"} else key
+            parts.append(f"{entity}-{_safe_entity(tags[key])}")
+    return "_".join(parts)
+
+
+def _events_from_bunch(subject_info):
+    cb = _as_bunch(subject_info)
+    events: dict[str, list[dict[str, float]]] = {}
+    has_amp = getattr(cb, "amplitudes", None) is not None
+
+    for ci, condition in enumerate(cb.conditions):
+        condition_events = []
+        for ti, onset in enumerate(cb.onsets[ci]):
+            event = {
+                "onset": float(onset),
+                "duration": float(cb.durations[ci][ti]),
+            }
+            if has_amp:
+                event["amplitude"] = float(cb.amplitudes[ci][ti])
+            condition_events.append(event)
+        events[condition] = condition_events
+    return events
+
 
 def cond_bunch_to_lsa(subject_info):
+    """Convert a normal condition Bunch to least-squares-all trial regressors.
+
+    Nipype's Function interface serializes only this function body, so helper
+    logic must live inside the function rather than referring to module globals.
+    """
     from nipype.interfaces.base import Bunch
-    cb = subject_info[0] if isinstance(subject_info, list) else subject_info
+
+    cb = subject_info[0] if isinstance(subject_info, (list, tuple)) else subject_info
     conditions, onsets, durations, amps = [], [], [], []
+    has_amp = getattr(cb, "amplitudes", None) is not None
+
     for ci, cname in enumerate(cb.conditions):
+        digits = max(3, len(str(len(cb.onsets[ci]))))
         for ti, onset in enumerate(cb.onsets[ci]):
-            tname = f"{cname}__{ti+1:03d}"
-            conditions.append(tname)
+            conditions.append(f"{cname}__{ti + 1:0{digits}d}")
             onsets.append([onset])
             durations.append([cb.durations[ci][ti]])
-            if getattr(cb, "amplitudes", None):
-                amps.append([cb.amplitudes[ci][ti]])
-            else:
-                amps.append([1.0])
+            amps.append([cb.amplitudes[ci][ti] if has_amp else 1.0])
 
     return [
         Bunch(
@@ -43,74 +108,303 @@ def cond_bunch_to_lsa(subject_info):
             tmod=None,
             pmod=None,
             regressor_names=None,
-            regressors=None
+            regressors=None,
         )
     ]
 
-def cond_bunch_to_lss(subject_info, mode='cond'):
+
+def cond_bunch_to_lss(subject_info):
+    """Convert a normal condition Bunch to HALFpipe-style LSS models.
+
+    Each generated model has:
+      [target_trial, same_condition_others, *other_original_conditions]
+
+    Nipype's Function interface serializes only this function body, so helper
+    logic must live inside the function rather than referring to module globals.
+    """
     from nipype.interfaces.base import Bunch
-    cb = subject_info[0] if isinstance(subject_info, list) else subject_info
-    flat = []
+
+    cb = subject_info[0] if isinstance(subject_info, (list, tuple)) else subject_info
     has_amp = getattr(cb, "amplitudes", None) is not None
-    for ci, cname in enumerate(cb.conditions):
-        for ti, onset in enumerate(cb.onsets[ci]):
-            flat.append(dict(
-                cname=cname,
-                onset=onset,
-                duration=cb.durations[ci][ti],
-                amp=(cb.amplitudes[ci][ti] if has_amp else 1.0),
-                trial_id=ti+1
-            ))
-    cond_names = cb.conditions
-    out = []
-    for k, tr in enumerate(flat):
-        roi = f"{tr['cname']}__{tr['trial_id']:03d}"
-        conditions = [roi]
-        onsets = [[tr['onset']]]
-        durations = [[tr['duration']]]
-        amplitudes = [[tr['amp']]]
-        others = [i for i in range(len(flat)) if i != k]
-        if mode == 'nuis':
-            conditions.append('others')
-            onsets.append([flat[i]['onset'] for i in others])
-            durations.append([flat[i]['duration'] for i in others])
-            amplitudes.append([flat[i]['amp'] for i in others])
-        elif mode == 'cond':
-            for cname in cond_names:
-                mask = [i for i in others if flat[i]['cname'] == cname]
-                if mask:
-                    conditions.append(f'{cname}_others')
-                    onsets.append([flat[i]['onset'] for i in mask])
-                    durations.append([flat[i]['duration'] for i in mask])
-                    amplitudes.append([flat[i]['amp'] for i in mask])
-        else:
-            raise ValueError(mode)
-        out.append(
-            Bunch(
-                conditions=conditions,
-                onsets=onsets, 
-                durations=durations,
-                amplitudes=amplitudes,
-                tmod=None,
-                pmod=None,
-                regressor_names=None,
-                regressors=None
+    subject_infos = []
+
+    for condition_index, (condition, condition_onsets, condition_durations) in enumerate(
+        zip(cb.conditions, cb.onsets, cb.durations, strict=True)
+    ):
+        digits = max(3, len(str(len(condition_onsets))))
+
+        other_conditions = list(cb.conditions)
+        other_conditions.pop(condition_index)
+        other_onsets_lists = list(cb.onsets)
+        other_onsets_lists.pop(condition_index)
+        other_duration_lists = list(cb.durations)
+        other_duration_lists.pop(condition_index)
+        if has_amp:
+            other_amplitude_lists = list(cb.amplitudes)
+            other_amplitude_lists.pop(condition_index)
+
+        for trial_index, (onset, duration) in enumerate(
+            zip(condition_onsets, condition_durations, strict=True)
+        ):
+            other_onsets = list(condition_onsets)
+            other_onsets.pop(trial_index)
+            other_durations = list(condition_durations)
+            other_durations.pop(trial_index)
+
+            conditions = [f"{condition}__{trial_index + 1:0{digits}d}", f"{condition}_others", *other_conditions]
+            onsets = [[onset], other_onsets, *other_onsets_lists]
+            durations = [[duration], other_durations, *other_duration_lists]
+
+            kwargs = {}
+            if has_amp:
+                other_amplitudes = list(cb.amplitudes[condition_index])
+                target_amplitude = other_amplitudes.pop(trial_index)
+                kwargs["amplitudes"] = [[target_amplitude], other_amplitudes, *other_amplitude_lists]
+
+            subject_infos.append(
+                Bunch(
+                    conditions=conditions,
+                    onsets=onsets,
+                    durations=durations,
+                    tmod=None,
+                    pmod=None,
+                    regressor_names=None,
+                    regressors=None,
+                    **kwargs,
+                )
             )
+
+    return subject_infos
+
+
+def group_lsa_parameter_estimates(subject_infos, param_estimates):
+    """Group LSA param-estimate files into one list per original condition."""
+    from collections import defaultdict
+
+    subject_info = subject_infos[0] if isinstance(subject_infos, (list, tuple)) else subject_infos
+    if isinstance(param_estimates, (list, tuple)) and len(param_estimates) == 1 and isinstance(param_estimates[0], (list, tuple)):
+        param_estimates = param_estimates[0]
+
+    grouped = defaultdict(list)
+    events = defaultdict(list)
+
+    for condition, onset, duration, pe_file in zip(
+        subject_info.conditions,
+        subject_info.onsets,
+        subject_info.durations,
+        param_estimates,
+        strict=False,
+    ):
+        original_condition = condition.rsplit("__", 1)[0] if "__" in condition else condition.rsplit("_", 1)[0]
+        grouped[original_condition].append(pe_file)
+        events[original_condition].append(
+            {"onset": float(onset[0]), "duration": float(duration[0])}
         )
-    return out
+
+    if grouped.keys() != events.keys():
+        raise ValueError("Mismatch between LSA parameter estimates and events")
+
+    return list(grouped.keys()), list(grouped.values()), list(events.values())
 
 
-def pick_roi_betas(param_lists, idx=0):
-    # param_lists: list of lists
-    return [plist[idx] for plist in param_lists]
+def group_lss_parameter_estimates(subject_infos, param_estimates):
+    """Group the first beta from each LSS model into one list per original condition."""
+    from collections import defaultdict
+
+    grouped = defaultdict(list)
+    events = defaultdict(list)
+
+    for subject_info, pe_files in zip(subject_infos, param_estimates, strict=True):
+        condition = subject_info.conditions[0]
+        original_condition = condition.rsplit("__", 1)[0] if "__" in condition else condition.rsplit("_", 1)[0]
+        grouped[original_condition].append(pe_files[0])
+        events[original_condition].append(
+            {
+                "onset": float(subject_info.onsets[0][0]),
+                "duration": float(subject_info.durations[0][0]),
+            }
+        )
+
+    if grouped.keys() != events.keys():
+        raise ValueError("Mismatch between LSS parameter estimates and events")
+
+    return list(grouped.keys()), list(grouped.values()), list(events.values())
 
 
-def _get_scan_start(vals) -> float:
-    return float(vals["scan_start"])
+def format_condition_bids_filenames(
+    tags: dict,
+    conditions: list[str],
+    estimator: str,
+):
+    import re
+
+    def safe_entity(value):
+        value = str(value)
+        value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+        return value or "unknown"
+
+    parts = []
+    for key in ["subject", "session", "task", "run", "space"]:
+        if key in tags and tags[key] not in (None, ""):
+            entity = key[:3] if key in {"subject", "session"} else key
+            parts.append(f"{entity}-{safe_entity(tags[key])}")
+
+    base = "_".join(parts)
+
+    statmaps = []
+    metadata = []
+    masks = []
+
+    for condition in conditions:
+        cond = safe_entity(condition)
+        stem = f"{base}_feature-{estimator}_condition-{cond}"
+        statmaps.append(f"{stem}_stat-effect_statmap.nii.gz")
+        metadata.append(f"{stem}_stat-effect_statmap.json")
+        masks.append(f"{stem}_mask.nii.gz")
+
+    return statmaps, metadata, masks
 
 
-def extract_conditions(subject_info):
-    return {"TrialList": subject_info[0].conditions}
+def repeat_file_to_match(in_file, items):
+    return [in_file for _ in items]
+
+def format_design_filenames(tags: dict):
+    import re
+
+    def safe_entity(value):
+        value = str(value)
+        value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+        return value or "unknown"
+
+    parts = []
+    for key in ["subject", "session", "task", "run", "space"]:
+        if key in tags and tags[key] not in (None, ""):
+            entity = key[:3] if key in {"subject", "session"} else key
+            parts.append(f"{entity}-{safe_entity(tags[key])}")
+    base = "_".join(parts)
+
+    return [
+        f"{base}_feature-LSA_desc-design_matrix.png",
+        f"{base}_feature-LSA_desc-design_matrix.mat",
+        f"{base}_feature-LSS_desc-design_matrix.png",
+        f"{base}_feature-LSS_desc-design_matrix.mat",
+    ]
+
+
+def write_condition_metadata_jsons(
+    metadata: dict,
+    conditions: list[str],
+    events: list[list[dict]],
+    estimator: str,
+):
+    import json
+    import re
+    from pathlib import Path
+
+    def safe_entity(value):
+        value = str(value)
+        value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+        return value or "unknown"
+
+    out_files = []
+    cwd = Path.cwd()
+
+    for condition, condition_events in zip(conditions, events, strict=True):
+        out_metadata = dict(metadata)
+        out_metadata.update(
+            {
+                "condition": condition,
+                "estimation": estimator,
+                "events": condition_events,
+            }
+        )
+        out_file = cwd / f"condition-{safe_entity(condition)}_desc-{estimator}_betas.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(out_metadata, f, indent=4, ensure_ascii=False)
+        out_files.append(str(out_file))
+
+    return out_files
+
+
+def format_condition_metadata_filenames(
+        tags: dict,
+        conditions: list[str],
+        estimator: str
+    ):
+    import re
+
+    def safe_entity(value):
+        value = str(value)
+        value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+        return value or "unknown"
+
+    parts = []
+    for key in ["subject", "session", "task", "run", "space"]:
+        if key in tags and tags[key] not in (None, ""):
+            entity = key[:3] if key in {"subject", "session"} else key
+            parts.append(f"{entity}-{safe_entity(tags[key])}")
+    base = "_".join(parts)
+
+    return [
+        f"{base}_condition-{safe_entity(condition)}_desc-{estimator}_betas.json"
+        for condition in conditions
+    ]
+
+
+def collect_base_metadata(
+    tags,
+    vals,
+    Conditions,
+    ConditionFile,
+    ConditionUnits,
+    BasedOn,
+):
+    """Create run-level metadata without legacy TrialList entries.
+
+    Per-condition beta sidecars receive their condition-specific ``events`` list
+    downstream, matching HALFpipe's single-trial resultdict metadata semantics.
+    """
+    metadata = {
+        "Sources": BasedOn,
+        "Conditions": Conditions,
+        "ConditionFile": ConditionFile,
+        "ConditionUnits": ConditionUnits,
+    }
+    if isinstance(vals, dict):
+        metadata.update(vals)
+    if isinstance(tags, dict):
+        metadata["Tags"] = tags
+    return metadata
+
+
+def select_first(in_files):
+    return in_files[0] if in_files else None
+
+
+def generate_sink_paths(tags):
+    sub_id = tags.get("subject")
+    ses_id = tags.get("session")
+    task_id = tags.get("task")
+
+    if not sub_id:
+        raise ValueError("Missing subject ID in tags")
+
+    container = f"sub-{sub_id}"
+    if ses_id:
+        container += f"/ses-{ses_id}"
+
+    return container, task_id
+
+def generate_datasink_substitutions(task_id):
+    if task_id:
+        return [
+            ("func/task", f"func/task-{task_id}"),
+        ]
+
+    # remove empty task directory
+    return [
+        ("func/task", "func"),
+    ]
 
 
 def init_singletrials_wf(
@@ -118,423 +412,349 @@ def init_singletrials_wf(
     feature,
     condition_files,
     condition_units,
-    derivatives=None
+    confound_file=None,
+    derivatives=None,
 ):
     """
-    Create a workflow that runs GLMsingle then dynamically builds and sinks
-    resultdicts for each model in the nifti_outputs.
-    """
-    name = "singletrials_wf"
-    workflow = pe.Workflow(name=name)
+    Create a single-trial workflow with HALFpipe-style condition-wise beta time series outputs.
 
-    # Input & Output nodes
+    Outputs are harmonized with HALFpipe's task_based.py single-trial logic:
+    parameter estimates are grouped by original condition, merged along the
+    fourth dimension per condition, and paired with per-condition event metadata.
+    """
+    workflow = pe.Workflow(name="singletrials_wf")
+
     inputnode = pe.Node(
         niu.IdentityInterface(
             fields=[
-                'tags',
-                'vals',
-                'metadata',
-                'bold',
-                'mask',
-                'repetition_time',
-                'confounds_selected',
-                'condition_names',
-                'condition_files',
-                'condition_units',
+                "tags",
+                "vals",
+                "metadata",
+                "bold",
+                "mask",
+                "repetition_time",
+                "confounds_selected",
+                "condition_names",
+                "condition_files",
+                "condition_units",
             ]
         ),
-        name='inputnode'
+        name="inputnode",
     )
-
     inputnode.inputs.condition_names = feature.conditions
     inputnode.inputs.condition_files = condition_files
     inputnode.inputs.condition_units = condition_units
+    inputnode.inputs.confounds_selected = confound_file
 
-    #------------------------------------------------------------------
-    # general
-    parse_condition_file = pe.Node(
-        ParseConditionFile(),
-        name='parse_condition_file'
-    )
-
-    get_scan_start = pe.Node(
-        niu.Function(
-            input_names=['vals'],
-            output_names=['scan_start'],
-            function=_get_scan_start
+    outputnode = pe.Node(
+        niu.IdentityInterface(
+            fields=[
+                "lsa_betas",
+                "lss_betas",
+                "lsa_conditions",
+                "lss_conditions",
+                "lsa_events",
+                "lss_events",
+                "lsa_metadata",
+                "lss_metadata",
+                "lsa_masks",
+                "lss_masks",
+            ]
         ),
-        name='get_scan_start'
+        name="outputnode",
     )
 
-    apply_condition_offset = pe.Node(
-        ApplyConditionOffset(),
-        name='apply_condition_offset'
+    parse_condition_file = pe.Node(ParseConditionFile(), name="parse_condition_file")
+    get_scan_start = pe.Node(
+        niu.Function(input_names=["vals"], output_names=["scan_start"], function=_get_scan_start),
+        name="get_scan_start",
     )
+    apply_condition_offset = pe.Node(ApplyConditionOffset(), name="apply_condition_offset")
 
-    # generate design from first level specification
     if feature.hrf == "dgamma":
         bases: dict[str, dict] = dict(dgamma=dict())
     elif feature.hrf == "dgamma_with_derivs":
         bases = dict(dgamma=dict(derivs=True))
     elif feature.hrf == "flobs":
-        bfcustompath = Path(os.environ["FSLDIR"]) / "etc" / "default_flobs.flobs" / "hrfbasisfns.txt"
-        assert bfcustompath.is_file()
-        bases = dict(
-            custom=dict(
-                bfcustompath=str(bfcustompath),
-                basisfnum=3,
-            )
-        )
+        flobs_path = Path(os.environ["FSLDIR"]) / "etc" / "default_flobs.flobs" / "hrfbasisfns.txt"
+        if not flobs_path.is_file():
+            raise FileNotFoundError(f"FLOBS basis function file {flobs_path} does not exist")
+        bases = dict(custom=dict(bfcustompath=str(flobs_path), basisfnum=3))
     else:
         raise ValueError(f'HRF "{feature.hrf}" is not yet implemented')
 
-    #
-    fillna = pe.Node(
-        FillNA(),
-        name="fillna"
-    )
+    fillna = pe.Node(FillNA(), name="fillna")
 
-    extract_conditions_node = pe.Node(
+    base_metadata = pe.Node(
         niu.Function(
-            input_names=["subject_info"],
-            output_names=["trial_list"],
-            function=extract_conditions,
+            input_names=[
+                "tags",
+                "vals",
+                "Conditions",
+                "ConditionFile",
+                "ConditionUnits",
+                "BasedOn",
+            ],
+            output_names=["metadata"],
+            function=collect_base_metadata,
         ),
-        name="extract_conditions"
+        name="base_metadata",
     )
 
-    #------------------------------------------------------------------
-    # LSA
+    # ------------------------------------------------------------------
+    # LSA branch
     cond2lsa = pe.Node(
         niu.Function(
-            input_names=['subject_info'],
-            output_names=['lsa_subject_info'],
-            function=cond_bunch_to_lsa
+            input_names=["subject_info"],
+            output_names=["lsa_subject_info"],
+            function=cond_bunch_to_lsa,
         ),
-        name='cond2lsa'
+        name="cond2lsa",
     )
 
-    spec_lsa = pe.Node(
-        model.SpecifyModel(),
-        name='specify_lsa'
-    )
-
-    spec_lsa.inputs.high_pass_filter_cutoff = np.inf  # disable if missing
+    spec_lsa = pe.Node(model.SpecifyModel(), name="specify_lsa")
+    spec_lsa.inputs.high_pass_filter_cutoff = np.inf
     if hasattr(feature, "high_pass_filter_cutoff"):
         hpfc = feature.high_pass_filter_cutoff
         if isinstance(hpfc, float) and isfinite(hpfc):
             spec_lsa.inputs.high_pass_filter_cutoff = hpfc
 
     l1_lsa = pe.Node(
-        fslm.Level1Design(
-            model_serial_correlations=False,
-            bases=bases,
-        ),
-        name='l1design_lsa'
+        fslm.Level1Design(model_serial_correlations=False, bases=bases),
+        name="l1design_lsa",
     )
+    feat_lsa = pe.Node(FEATModel(), name="featmodel_lsa")
+    film_lsa = pe.Node(FILMGLS(autocorr_noestimate=True), name="filmgls_lsa")
 
-    feat_lsa = pe.Node(
-        FEATModel(),
-        name='featmodel_lsa',
-    )
-
-    film_lsa = pe.Node(
-        FILMGLS(
-            autocorr_noestimate=True
-        ),
-        name='filmgls_lsa',
-    )
-
-    def select_trial_betas(in_files, trial_list):
-        # Number of trial regressors
-        n_trials = len(trial_list["TrialList"]) if isinstance(trial_list, dict) else len(trial_list)
-        return in_files[:n_trials]
-
-    # limit to nr of trials
-    pick_lsa = pe.Node(
+    group_lsa = pe.Node(
         niu.Function(
-            input_names=["in_files", "trial_list"],
-            output_names=["out_files"],
-            function=select_trial_betas
+            input_names=["subject_infos", "param_estimates"],
+            output_names=["conditions", "param_estimates", "events"],
+            function=group_lsa_parameter_estimates,
         ),
-        name="pick_lsa"
+        name="group_lsa_parameter_estimates",
+    )
+    merge_lsa = pe.MapNode(
+        Merge(dimension="t", output_type="NIFTI_GZ", merged_file="merged_lsa_betas.nii.gz"),
+        iterfield=["in_files"],
+        name="merge_lsa_by_condition",
     )
 
-    merge_lsa = pe.Node(
-        Merge(
-            dimension='t',
-            output_type='NIFTI_GZ',
-            merged_file="merged_betas.nii.gz"
-        ),
-        name='merge_betas_lsa'
-    )
-    
-    #------------------------------------------------------------------
-    # LSS
+    # ------------------------------------------------------------------
+    # LSS branch
     cond2lss = pe.Node(
         niu.Function(
-            input_names=['subject_info','mode'],
-            output_names=['lss_subject_infos'],
-            function=cond_bunch_to_lss
+            input_names=["subject_info"],
+            output_names=["lss_subject_infos"],
+            function=cond_bunch_to_lss,
         ),
-        name='cond2lss'
+        name="cond2lss",
     )
-
-    spec_lss = pe.MapNode(
-        model.SpecifyModel(),
-        iterfield=['subject_info'],
-        name='specify_lss'
-    )
-
-    spec_lss.inputs.high_pass_filter_cutoff = np.inf  # disable if missing
+    spec_lss = pe.MapNode(model.SpecifyModel(), iterfield=["subject_info"], name="specify_lss")
+    spec_lss.inputs.high_pass_filter_cutoff = np.inf
     if hasattr(feature, "high_pass_filter_cutoff"):
         hpfc = feature.high_pass_filter_cutoff
         if isinstance(hpfc, float) and isfinite(hpfc):
             spec_lss.inputs.high_pass_filter_cutoff = hpfc
-            
+
     l1_lss = pe.MapNode(
-        fslm.Level1Design(
-            model_serial_correlations=False,
-            bases=bases,
-        ),
-        iterfield=['session_info'],
-        name='l1design_lss'
+        fslm.Level1Design(model_serial_correlations=False, bases=bases),
+        iterfield=["session_info"],
+        name="l1design_lss",
     )
-
-    feat_lss = pe.MapNode(
-        FEATModel(),
-        iterfield=['fsf_file','ev_files'],
-        name='featmodel_lss'
-    )
-
+    feat_lss = pe.MapNode(FEATModel(), iterfield=["fsf_file", "ev_files"], name="featmodel_lss")
     film_lss = pe.MapNode(
-        FILMGLS(
-            autocorr_noestimate=True
-        ),
-        iterfield=['design_file'],
-        name='filmgls_lss'
+        FILMGLS(autocorr_noestimate=True),
+        iterfield=["design_file"],
+        name="filmgls_lss",
     )
 
-    pick_lss = pe.Node(
+    group_lss = pe.Node(
         niu.Function(
-            input_names=['param_lists','idx'],
-            output_names=['roi_betas'],
-            function=pick_roi_betas
+            input_names=["subject_infos", "param_estimates"],
+            output_names=["conditions", "param_estimates", "events"],
+            function=group_lss_parameter_estimates,
         ),
-        name='pick_lss_betas'
+        name="group_lss_parameter_estimates",
     )
-    
-    pick_lss.inputs.idx = 0
-
-    merge_lss = pe.Node(
-        Merge(
-            dimension='t',
-            output_type='NIFTI_GZ',
-            merged_file="merged_betas.nii.gz"
-        ),
-        name='merge_betas_lss'
+    merge_lss = pe.MapNode(
+        Merge(dimension="t", output_type="NIFTI_GZ", merged_file="merged_lss_betas.nii.gz"),
+        iterfield=["in_files"],
+        name="merge_lss_by_condition",
     )
 
-    # maybe just once in merge_resultdicts?
-    if feature is not None:
-        cond2lss.inputs.mode = feature.mode
-
-    def format_bids_filenames(tags: dict):
-        """
-        Generate BIDS-style filenames for LSA and LSS outputs.
-        """
-        parts = []
-        for key in ["subject", "session", "task", "run", "space"]:
-            if key in tags:
-                if key in ["subject", "session"]:
-                    kk = key[:3]
-                else:
-                    kk = key
-                    
-                parts.append(f"{kk}-{tags[key]}")
-
-        base = "_".join(parts)
-        return [
-            f"{base}_desc-lsa_betas.nii.gz",
-            f"{base}_desc-lss_betas.nii.gz",
-            f"{base}.json",
-            f"{base}_desc-lss_betas.png",
-            f"{base}_desc-lss_betas.mat",
-            f"{base}_desc-lsa_betas.png",
-            f"{base}_desc-lsa_betas.mat",            
-        ]
-
-    # format output names
-    format_bids_names = pe.Node(
+    # ------------------------------------------------------------------
+    # Naming, metadata, and sinking
+    format_lsa_bids_names = pe.Node(
         niu.Function(
-            input_names=["tags"],
+            input_names=["tags", "conditions", "estimator"],
+            output_names=["statmap_names", "metadata_names", "mask_names"],
+            function=format_condition_bids_filenames,
+        ),
+        name="format_lsa_bids_names",
+    )
+    format_lsa_bids_names.inputs.estimator = "LSA"
+
+    format_lss_bids_names = pe.Node(
+        niu.Function(
+            input_names=["tags", "conditions", "estimator"],
+            output_names=["statmap_names", "metadata_names", "mask_names"],
+            function=format_condition_bids_filenames,
+        ),
+        name="format_lss_bids_names",
+    )
+    format_lss_bids_names.inputs.estimator = "LSS"
+
+    rename_lsa = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lsa_outputs",
+    )
+    rename_lss = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lss_outputs",
+    )
+
+    repeat_lsa_mask = pe.Node(
+        niu.Function(
+            input_names=["in_file", "items"],
+            output_names=["out_files"],
+            function=repeat_file_to_match,
+        ),
+        name="repeat_lsa_mask",
+    )
+    repeat_lss_mask = pe.Node(
+        niu.Function(
+            input_names=["in_file", "items"],
+            output_names=["out_files"],
+            function=repeat_file_to_match,
+        ),
+        name="repeat_lss_mask",
+    )
+    rename_lsa_masks = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lsa_masks",
+    )
+    rename_lss_masks = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lss_masks",
+    )
+
+    write_lsa_metadata = pe.Node(
+        niu.Function(
+            input_names=["metadata", "conditions", "events", "estimator"],
+            output_names=["out_files"],
+            function=write_condition_metadata_jsons,
+        ),
+        name="write_lsa_metadata",
+    )
+    write_lsa_metadata.inputs.estimator = "LSA"
+
+    write_lss_metadata = pe.Node(
+        niu.Function(
+            input_names=["metadata", "conditions", "events", "estimator"],
+            output_names=["out_files"],
+            function=write_condition_metadata_jsons,
+        ),
+        name="write_lss_metadata",
+    )
+    write_lss_metadata.inputs.estimator = "LSS"
+
+    format_lsa_metadata_names = pe.Node(
+        niu.Function(
+            input_names=["tags", "conditions", "estimator"],
             output_names=["out_names"],
-            function=format_bids_filenames  # use the full function, not lambda
+            function=format_condition_metadata_filenames,
         ),
-        name="format_bids_names"
+        name="format_lsa_metadata_names",
+    )
+    format_lsa_metadata_names.inputs.estimator = "LSA"
+
+    format_lss_metadata_names = pe.Node(
+        niu.Function(
+            input_names=["tags", "conditions", "estimator"],
+            output_names=["out_names"],
+            function=format_condition_metadata_filenames,
+        ),
+        name="format_lss_metadata_names",
+    )
+    format_lss_metadata_names.inputs.estimator = "LSS"
+
+    rename_lsa_metadata = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lsa_metadata",
+    )
+    rename_lss_metadata = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_lss_metadata",
     )
 
-    rename_outputs  = pe.MapNode(
-        niu.Rename(),
-        name="rename_outputs",
-        iterfield=["in_file", "format_string"]
+    format_design_names = pe.Node(
+        niu.Function(input_names=["tags"], output_names=["out_names"], function=format_design_filenames),
+        name="format_design_names",
+    )
+    select_first_lss_png = pe.Node(
+        niu.Function(input_names=["in_files"], output_names=["out_file"], function=select_first),
+        name="select_first_lss_png",
+    )
+    select_first_lss_mat = pe.Node(
+        niu.Function(input_names=["in_files"], output_names=["out_file"], function=select_first),
+        name="select_first_lss_mat",
+    )
+    collect_design_files = pe.Node(niu.Merge(4), name="collect_design_files")
+    rename_designs = pe.MapNode(
+        niu.Rename(keep_ext=False),
+        iterfield=["in_file", "format_string"],
+        name="rename_designs",
     )
 
-    # datasink
     if derivatives is None:
         derivatives = os.path.join(workdir, "derivatives", "stglm")
 
-    derivatives = str(derivatives)
-
-    # metadata
-    sanitize_metadata = pe.Node(
-        niu.Function(
-            input_names=[
-                "tags",
-                "vals",
-                "trial_list",
-                "Conditions",
-                "ConditionFile",
-                "ConditionUnits",
-                "BasedOn",
-                "BetasLSA",
-                "BetasLSS"
-            ],
-            output_names=["metadata"],
-            function=generate_sanitized_metadata
-        ),
-        name="sanitize_metadata"
-    )
-
-    def write_metadata_json(in_dict, out_name="metadata.json"):
-        import json
-        from pathlib import Path
-
-        # Get the current working directory of the node (runtime dir)
-        cwd = Path.cwd()
-
-        # Define the output path in the node’s directory
-        out_path = cwd / out_name
-
-        # Write JSON with pretty formatting
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(in_dict, f, indent=4, ensure_ascii=False)
-
-        return str(out_path)
-
-    write_json_node = pe.Node(
-        niu.Function(
-            input_names=["in_dict", "out_name"],
-            output_names=["out_file"],
-            function=write_metadata_json
-        ),
-        name="write_json_node"
-    )
-
-    def collect_generated_outputs(lsa_file, lss_file, lsa_mat, lsa_png, lss_mat, lss_png, json_file):
-        return [lsa_file, lss_file, json_file, lss_png, lss_mat, lsa_png, lsa_mat]
-
-    generate_outputs = pe.Node(
-        niu.Function(
-            input_names=[
-                "lsa_file",
-                "lss_file",
-                "lsa_mat",
-                "lsa_png",
-                "lss_mat",
-                "lss_png",
-                "json_file"
-            ],
-            output_names=["file_list"],
-            function=collect_generated_outputs
-        ),
-        name="generate_outputs"
-    )
-
-    def split_renamed_outputs(file_list):
-        return tuple(file_list)
-
-    split_outputs = pe.Node(
-        niu.Function(
-            input_names=["file_list"],
-            output_names=[
-                "out_lsa",
-                "out_lss",
-                "out_json",
-                "out_lss_png",
-                "out_lss_mat",
-                "out_lsa_png",
-                "out_lsa_mat"
-            ],
-            function=split_renamed_outputs
-        ),
-        name="split_outputs"
-    )
-
     datasink = pe.Node(
-        DataSink(
-            parameterization=False,
-            base_directory=str(derivatives),
-        ),
-        name="stglm_datasink"
+        DataSink(parameterization=False, base_directory=str(derivatives)),
+        name="stglm_datasink",
     )
-
-    def generate_sink_paths(tags):
-        sub_id = tags.get("subject")
-        ses_id = tags.get("session")
-
-        if not sub_id:
-            raise ValueError("Missing subject ID in tags")
-
-        container = f"sub-{sub_id}"
-        if ses_id:
-            container += f"/ses-{ses_id}"
-
-        func_path = "func"
-        return container, func_path
-
     get_sink_paths = pe.Node(
         niu.Function(
             input_names=["tags"],
-            output_names=["container", "func_path"],
+            output_names=["container", "task_id"],
             function=generate_sink_paths
         ),
-        name="get_sink_paths"
+        name="get_sink_paths",
     )
 
-    select_first_png = pe.Node(
+    get_datasink_substitutions = pe.Node(
         niu.Function(
-            input_names=["file_list"],
-            output_names=["first_file"],
-            function=lambda file_list: file_list[0] if file_list else None
+            input_names=["task_id"],
+            output_names=["substitutions"],
+            function=generate_datasink_substitutions,
         ),
-        name="select_first_png"
+        name="get_datasink_substitutions",
     )
 
-    select_first_mat = pe.Node(
-        niu.Function(
-            input_names=["file_list"],
-            output_names=["first_file"],
-            function=lambda file_list: file_list[0] if file_list else None
-        ),
-        name="select_first_mat"
-    )    
-
-    # if confound file is specified
     if isdefined(inputnode.inputs.confounds_selected):
         workflow.connect([
-            (inputnode, fillna, [('confounds_selected', 'in_tsv')]),
-            (fillna, spec_lsa,  [('out_no_header', 'realignment_parameters')]),
-            (fillna, spec_lss,  [('out_no_header', 'realignment_parameters')]),
+            (inputnode, fillna, [("confounds_selected", "in_tsv")]),
+            (fillna, spec_lsa, [("out_no_header", "realignment_parameters")]),
+            (fillna, spec_lss, [("out_no_header", "realignment_parameters")]),
         ])
 
-    # Connect the core graph
     workflow.connect([
-        # scan start offset
-        (inputnode, get_scan_start, [('vals','vals')]),
-        (inputnode, format_bids_names, [("tags", "tags")]),
-        (inputnode, get_sink_paths, [("tags", "tags")]),
-        (inputnode, sanitize_metadata, [
+        # General parsing and timing
+        (inputnode, parse_condition_file, [
+            ("condition_names", "condition_names"),
+            ("condition_files", "in_any"),
+        ]),
+        (inputnode, get_scan_start, [("vals", "vals")]),
+        (parse_condition_file, apply_condition_offset, [("subject_info", "subject_info")]),
+        (get_scan_start, apply_condition_offset, [("scan_start", "scan_start")]),
+        (inputnode, base_metadata, [
             ("tags", "tags"),
             ("vals", "vals"),
             ("condition_names", "Conditions"),
@@ -542,90 +762,103 @@ def init_singletrials_wf(
             ("condition_units", "ConditionUnits"),
             ("bold", "BasedOn"),
         ]),
+        (inputnode, get_sink_paths, [("tags", "tags")]),
+        (inputnode, format_design_names, [("tags", "tags")]),
 
-        # parse conditions
-        (inputnode, parse_condition_file, [
-            ('condition_names','condition_names'),
-            ('condition_files','in_any')
-        ]),
-        (get_scan_start, apply_condition_offset, [('scan_start','scan_start')]),
-        (parse_condition_file, apply_condition_offset, [('subject_info','subject_info')]),
-
-        # LSA
+        # LSA design/model
+        (apply_condition_offset, cond2lsa, [("subject_info", "subject_info")]),
         (inputnode, spec_lsa, [
-            ('bold','functional_runs'),
-            ('repetition_time','time_repetition'),
-            ('condition_units', 'input_units')
+            ("bold", "functional_runs"),
+            ("repetition_time", "time_repetition"),
+            ("condition_units", "input_units"),
         ]),
-        (apply_condition_offset, cond2lsa, [('subject_info', 'subject_info')]),
-        (cond2lsa, extract_conditions_node, [("lsa_subject_info", "subject_info")]),
-        (cond2lsa,  spec_lsa, [('lsa_subject_info','subject_info')]),
-        (spec_lsa,  l1_lsa,   [('session_info','session_info')]),
-        (inputnode, l1_lsa,   [('repetition_time', 'interscan_interval')]),
-        (l1_lsa,    feat_lsa, [
-            ('fsf_files','fsf_file'),
-            ('ev_files','ev_files')
-        ]),
-        (feat_lsa,  film_lsa, [('design_file','design_file')]),
-        (inputnode, film_lsa, [('bold','in_file')]),
-        (film_lsa,  pick_lsa, [("param_estimates", "in_files")]),
-        (extract_conditions_node, pick_lsa, [("trial_list", "trial_list")]),
-        (pick_lsa,  merge_lsa,[('out_files','in_files')]),
+        (cond2lsa, spec_lsa, [("lsa_subject_info", "subject_info")]),
+        (spec_lsa, l1_lsa, [("session_info", "session_info")]),
+        (inputnode, l1_lsa, [("repetition_time", "interscan_interval")]),
+        (l1_lsa, feat_lsa, [("fsf_files", "fsf_file"), ("ev_files", "ev_files")]),
+        (feat_lsa, film_lsa, [("design_file", "design_file")]),
+        (inputnode, film_lsa, [("bold", "in_file")]),
 
-        # LSS
+        # LSA HALFpipe-style grouping/output
+        (cond2lsa, group_lsa, [("lsa_subject_info", "subject_infos")]),
+        (film_lsa, group_lsa, [("param_estimates", "param_estimates")]),
+        (group_lsa, merge_lsa, [("param_estimates", "in_files")]),
+        (inputnode, format_lsa_bids_names, [("tags", "tags")]),
+        (group_lsa, format_lsa_bids_names, [("conditions", "conditions")]),
+        (merge_lsa, rename_lsa, [("merged_file", "in_file")]),
+        (format_lsa_bids_names, rename_lsa, [("statmap_names", "format_string")]),
+        (base_metadata, write_lsa_metadata, [("metadata", "metadata")]),
+        (group_lsa, write_lsa_metadata, [("conditions", "conditions"), ("events", "events")]),
+        (write_lsa_metadata, rename_lsa_metadata, [("out_files", "in_file")]),
+        (format_lsa_bids_names, rename_lsa_metadata, [("metadata_names", "format_string")]),
+        (inputnode, repeat_lsa_mask, [("mask", "in_file")]),
+        (group_lsa, repeat_lsa_mask, [("conditions", "items")]),
+        (repeat_lsa_mask, rename_lsa_masks, [("out_files", "in_file")]),
+        (format_lsa_bids_names, rename_lsa_masks, [("mask_names", "format_string")]),
+
+        # LSS design/model
+        (apply_condition_offset, cond2lss, [("subject_info", "subject_info")]),
         (inputnode, spec_lss, [
-            ('bold','functional_runs'),
-            ('repetition_time','time_repetition'),
-            ('condition_units', 'input_units')
+            ("bold", "functional_runs"),
+            ("repetition_time", "time_repetition"),
+            ("condition_units", "input_units"),
         ]),
-        (apply_condition_offset, cond2lss, [('subject_info', 'subject_info')]),
-        (cond2lss,  spec_lss, [('lss_subject_infos','subject_info')]),
-        (spec_lss,  l1_lss,   [('session_info','session_info')]),
-        (inputnode, l1_lss,   [('repetition_time', 'interscan_interval')]),
-        (l1_lss,    feat_lss, [
-            ('fsf_files','fsf_file'),
-            ('ev_files','ev_files')
-        ]),
-        (feat_lss,  film_lss, [('design_file','design_file')]),
-        (inputnode, film_lss, [('bold','in_file')]),
-        (film_lss,  pick_lss, [('param_estimates','param_lists')]),
-        (pick_lss,  merge_lss,[('roi_betas','in_files')]),
-        (feat_lss, select_first_png, [("design_image", "file_list")]),
-        (feat_lss, select_first_mat, [("design_file", "file_list")]),
+        (cond2lss, spec_lss, [("lss_subject_infos", "subject_info")]),
+        (spec_lss, l1_lss, [("session_info", "session_info")]),
+        (inputnode, l1_lss, [("repetition_time", "interscan_interval")]),
+        (l1_lss, feat_lss, [("fsf_files", "fsf_file"), ("ev_files", "ev_files")]),
+        (feat_lss, film_lss, [("design_file", "design_file")]),
+        (inputnode, film_lss, [("bold", "in_file")]),
 
-        # metadata
-        (extract_conditions_node, sanitize_metadata, [("trial_list", "trial_list")]),
-        (sanitize_metadata, write_json_node, [("metadata", "in_dict")]),
+        # LSS HALFpipe-style grouping/output
+        (cond2lss, group_lss, [("lss_subject_infos", "subject_infos")]),
+        (film_lss, group_lss, [("param_estimates", "param_estimates")]),
+        (group_lss, merge_lss, [("param_estimates", "in_files")]),
+        (inputnode, format_lss_bids_names, [("tags", "tags")]),
+        (group_lss, format_lss_bids_names, [("conditions", "conditions")]),
+        (merge_lss, rename_lss, [("merged_file", "in_file")]),
+        (format_lss_bids_names, rename_lss, [("statmap_names", "format_string")]),
+        (base_metadata, write_lss_metadata, [("metadata", "metadata")]),
+        (group_lss, write_lss_metadata, [("conditions", "conditions"), ("events", "events")]),
+        (write_lss_metadata, rename_lss_metadata, [("out_files", "in_file")]),
+        (format_lss_bids_names, rename_lss_metadata, [("metadata_names", "format_string")]),
+        (inputnode, repeat_lss_mask, [("mask", "in_file")]),
+        (group_lss, repeat_lss_mask, [("conditions", "items")]),
+        (repeat_lss_mask, rename_lss_masks, [("out_files", "in_file")]),
+        (format_lss_bids_names, rename_lss_masks, [("mask_names", "format_string")]),
 
-        # generate outputs
-        (merge_lsa, generate_outputs, [("merged_file", "lsa_file")]),
-        (merge_lss, generate_outputs, [("merged_file", "lss_file")]),
-        (write_json_node, generate_outputs, [("out_file", "json_file")]),
-        (feat_lsa, generate_outputs, [("design_file", "lsa_mat")]),
-        (feat_lsa, generate_outputs, [("design_image", "lsa_png")]),
-        (select_first_mat, generate_outputs, [("first_file", "lss_mat")]),
-        (select_first_png, generate_outputs, [("first_file", "lss_png")]),
+        # Design matrices/images: keep one LSA design and the first LSS design for QC
+        (feat_lsa, collect_design_files, [("design_image", "in1"), ("design_file", "in2")]),
+        (feat_lss, select_first_lss_png, [("design_image", "in_files")]),
+        (feat_lss, select_first_lss_mat, [("design_file", "in_files")]),
+        (select_first_lss_png, collect_design_files, [("out_file", "in3")]),
+        (select_first_lss_mat, collect_design_files, [("out_file", "in4")]),
+        (collect_design_files, rename_designs, [("out", "in_file")]),
+        (format_design_names, rename_designs, [("out_names", "format_string")]),
 
-        # feed into renaming for later DataSink
-        (generate_outputs, rename_outputs, [("file_list", "in_file")]),
-        (format_bids_names, rename_outputs, [("out_names", "format_string")]),
+        # Output node
+        (rename_lsa, outputnode, [("out_file", "lsa_betas")]),
+        (rename_lss, outputnode, [("out_file", "lss_betas")]),
+        (rename_lsa_metadata, outputnode, [("out_file", "lsa_metadata")]),
+        (rename_lss_metadata, outputnode, [("out_file", "lss_metadata")]),
+        (rename_lsa_masks, outputnode, [("out_file", "lsa_masks")]),
+        (rename_lss_masks, outputnode, [("out_file", "lss_masks")]),
+        (group_lsa, outputnode, [("conditions", "lsa_conditions"), ("events", "lsa_events")]),
+        (group_lss, outputnode, [("conditions", "lss_conditions"), ("events", "lss_events")]),
 
-        # split for proper parsing to DataSink
-        (rename_outputs, split_outputs, [("out_file", "file_list")]),
+        # DataSink
+        (get_sink_paths, get_datasink_substitutions, [("task_id", "task_id")]),
+
         (get_sink_paths, datasink, [("container", "container")]),
+        (get_datasink_substitutions, datasink, [("substitutions", "substitutions")]),
+
+        (rename_lsa, datasink, [("out_file", "func.task.@lsa_betas")]),
+        (rename_lss, datasink, [("out_file", "func.task.@lss_betas")]),
+        (rename_lsa_metadata, datasink, [("out_file", "func.task.@lsa_metadata")]),
+        (rename_lss_metadata, datasink, [("out_file", "func.task.@lss_metadata")]),
+        (rename_lsa_masks, datasink, [("out_file", "func.task.@lsa_masks")]),
+        (rename_lss_masks, datasink, [("out_file", "func.task.@lss_masks")]),
+        (rename_designs, datasink, [("out_file", "func.task.@designs")]),
     ])
-
-    sink_map = [
-        ("out_lsa", "func.@lsa"),
-        ("out_lss", "func.@lss"),
-        ("out_json", "func.@json"),
-        ("out_lss_png", "func.@lss_png"),
-        ("out_lss_mat", "func.@lss_mat"),
-        ("out_lsa_png", "func.@lsa_png"),
-        ("out_lsa_mat", "func.@lsa_mat"),
-    ]
-
-    for out_field, sink_path in sink_map:
-        workflow.connect(split_outputs, out_field, datasink, sink_path)
 
     return workflow

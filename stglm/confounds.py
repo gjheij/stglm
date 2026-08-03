@@ -5,7 +5,7 @@
 from nipype.interfaces import utility as niu
 from nipype.pipeline import engine as pe
 
-from .tsv import FillNA, SelectColumns
+from .tsv import SelectColumns
 
 
 def init_confounds_select_wf(

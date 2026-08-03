@@ -13,14 +13,24 @@ def test_concat():
     logger.info("Starting single-trial GLM workflow")
 
     project_dir = "/mnt/d/fMRI/HRA"
-    workdir = "/tmp/stglm_concat"
+    workdir = "/tmp/stglm_pybest"
+    evs = [
+        "CS-",
+        "CS+_noUCS",
+        "CS+_withUCS"
+    ]
+    hrf = "dgamma"
     subject = "015"
-    run_mode = "concat"
-    n_procs = 1
+    run_mode = "loop"
+    lss_mode = "cond"
+    n_procs = 4
     task = os.path.basename(project_dir)
-    desc = "masked"
+    desc = "pybest"
     confound_subset = "Motion parameters"
     deriv_dir = os.path.join(workdir, "derivatives", "stglm")
+    
+    # no confounds
+    no_confounds = True
 
     space = "T1w"
     space_kwargs = {} if space == "func" else {"space": space}
@@ -40,6 +50,7 @@ def test_concat():
         run_mode=run_mode,
         desc=desc,
         task=task,
+        no_confounds=True,
         **space_kwargs
     )
 
@@ -56,22 +67,22 @@ def test_concat():
         "Global signal": "global_signal",
     }
 
-    confound_regexes = [confound_options[confound_subset]]
-    logger.info(f"Using '{confound_subset}' ({confound_regexes}) from confound files")
+    confound_regexes = None
+    if not no_confounds:
+        confound_regexes = [confound_options[confound_subset]]
+        logger.info(f"Using '{confound_subset}' ({confound_regexes}) from confound files")
+    else:
+        logger.info("Not including any confounds; assuming data is already treated properly..")
 
+    logger.info(f"Including conditions: {evs}")
     ddict = {
-        "name": "SingleTrials",
-        "setting": "SingleTrialsSetting",
-        "type": "single_trials",
-        "conditions": [
-            "CS-",
-            "CS+_noUCS",
-            "CS+_withUCS"
-        ],
-        "hrf": "dgamma",
-        "mode": "cond"
+        "hrf": hrf,
+        "mode": lss_mode,
+        "confounds": confound_subset,
+        "confounds_regex": confound_regexes,
+        "conditions": evs
     }
-
+    
     feature = SimpleNamespace(**ddict)
 
     from nipype import config

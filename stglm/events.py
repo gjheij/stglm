@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import pandas as pd
 from scipy.io import loadmat
 
 import logging
@@ -20,6 +21,26 @@ def _extract_value(x: Any):
     if isinstance(x, np.ndarray):
         return _extract_value(x[0])
     return x
+
+
+def get_event_names(events_file: str) -> list[str]:
+    """Extract unique event names from a BIDS events file.
+
+    Supports both `event_type` and `trial_type` columns.
+    """
+    df_events = pd.read_csv(events_file, delimiter="\t")
+
+    event_col = next(
+        (c for c in ("event_type", "trial_type") if c in df_events.columns),
+        None,
+    )
+
+    if event_col is None:
+        raise ValueError(
+            "Event file must contain either an 'event_type' or 'trial_type' column."
+        )
+
+    return df_events[event_col].dropna().unique().tolist()
 
 
 @dataclass

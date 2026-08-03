@@ -3,6 +3,7 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
 from math import isclose
+import numpy as np
 
 from nipype.interfaces.base import (
     Bunch,
@@ -12,8 +13,12 @@ from nipype.interfaces.base import (
     traits,
 )
 
+import pandas as pd
 from .events import ConditionFile
-import logging
+from stglm.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 class ApplyConditionOffsetInputSpec(TraitedSpec):
     subject_info = traits.Any()
@@ -40,11 +45,15 @@ class ApplyConditionOffset(SimpleInterface):
             for i, onset in enumerate(condition_onsets):
                 onset -= scan_start
                 if onset < 0:
-                    logging.warning(f'Condition "{condition}" onset truncated from {onset:f} to {0.0:f} s.')
+                    logger.warning(f'Condition "{condition}" onset truncated from {onset:f} to {0.0:f} s.')
                     onset = 0
                 condition_onsets[i] = onset
 
-        self._results["subject_info"] = Bunch(conditions=conditions, onsets=onsets, durations=durations)
+        self._results["subject_info"] = Bunch(
+            conditions=conditions,
+            onsets=onsets,
+            durations=durations
+        )
 
         return runtime
 
@@ -141,3 +150,63 @@ class ParseConditionFile(SimpleInterface):
         self._results["subject_info"] = Bunch(conditions=conditions, onsets=onsets, durations=durations)
 
         return runtime
+
+def events_to_glmsingle_dm(
+    events_df: pd.DataFrame,
+    n_vols: int,
+    tr: float = 1.0,
+    include_trials: list[str] | None = None,
+    event_col: str="trial_type"
+    ) -> pd.DataFrame:
+    """
+    Convert a BIDS events.tsv dataframe into a GLMsingle-style design matrix.
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        Must have columns ['onset', 'duration', event_col].
+        Onsets and durations are in seconds.
+    n_vols : int
+        Total number of volumes in your run.
+    tr : float, optional
+        Repetition time, in seconds. Defaults to 1.0 (i.e. onsets already in TR-units).
+    include_trials : list of str, optional
+        Trial types to include from the design. If None, all events are considered.
+    event_col: str, optional
+        Column name that holds the event names. Default is 'trial_type'
+
+    Returns
+    -------
+    dm : pd.DataFrame
+        Shape = (n_vols, n_conditions).  Each column is a stick regressor
+        for one trial type; a 1 at volume *i* means an event of that
+        type began at that TR, 0 otherwise.
+    """
+
+    if include_trials is not None:
+        events_df = events_df[events_df[event_col].isin(include_trials)].copy()
+
+    logger.info(f"design shape: {events_df.shape}")
+
+    # 1. Identify unique conditions (sorted for reproducibility)
+    conds = sorted(events_df[event_col].unique())
+    n_conds = len(conds)
+
+    # 2. Initialize empty design matrix
+    dm = np.zeros((n_vols, n_conds), dtype=int)
+
+    # 3. Map condition names → column indices
+    cond_to_idx = {cond: i for i, cond in enumerate(conds)}
+
+    # 4. Fill in sticks
+    for _, row in events_df.iterrows():
+        onset_sec = row['onset']
+        cond      = row[event_col]
+
+        # convert onset (s) → volume index
+        vol_idx = int(round(onset_sec / tr))
+
+        if 0 <= vol_idx < n_vols:
+            dm[vol_idx, cond_to_idx[cond]] = 1
+
+    return dm

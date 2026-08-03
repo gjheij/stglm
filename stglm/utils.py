@@ -2,12 +2,18 @@
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
+import os
 import pathlib
 import zipfile
 import subprocess
+import numpy as np
 import nibabel as nb
 from pathlib import Path
+from stglm.logger import get_logger
 
+logger = get_logger(__name__)
+
+opj = os.path.join
 AnyPath = pathlib.Path | zipfile.Path
 
 class File:
@@ -319,3 +325,84 @@ def generate_sanitized_metadata(tags, vals, trial_list, **kwargs):
         out["Sources"] = merged
 
     return out
+
+def plot_design_matrices(dms, output_dir=None, **kwargs):
+
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    fig,axs = plt.subplots(
+        ncols=len(dms),
+        figsize=(3*len(dms), len(dms)),
+        constrained_layout=True
+    )
+
+    for i, dm in enumerate(dms):
+        sns.heatmap(dm, ax=axs[i])
+        axs[i].set_title(f"run-{i+1}")
+
+    logger.info(f"Saving design matrices..")
+    fig.savefig(
+        opj(output_dir, "design_matrices.svg"),
+        bbox_inches="tight",
+        dpi=300,
+        facecolor="white"
+    )
+
+    return fig
+    
+def save_glmsingle_outputs(results, bold_file, outputdir, prefix="model"):
+    """
+    Save GLMsingle outputs using the mean of the first BOLD file as the template.
+    
+    Parameters:
+        results: GLMsingle output dictionary (e.g., results_glmsingle.output)
+        bold_file: path to the first functional NIfTI file
+        outputdir: directory to save NIfTI files
+    """
+    os.makedirs(outputdir, exist_ok=True)
+
+    # Load first BOLD and compute mean over time
+    logger.info(f"Loading reference file: {bold_file}")
+    img = nb.load(bold_file)
+    data = img.get_fdata()
+    mean_img = np.mean(data, axis=3)
+    mean_nifti = nb.Nifti1Image(mean_img, affine=img.affine, header=img.header)
+
+    affine = mean_nifti.affine
+    header = mean_nifti.header
+    shape = mean_img.shape
+
+    # Save final beta maps
+    
+    betas = results['betasmd']  # shape: X × Y × Z × C
+    n_digits = len(str(betas.shape[-1]))
+
+    logger.info(f"Saving {betas.shape[-1]} beta files")
+    for c in range(betas.shape[-1]):
+        beta_img = nb.Nifti1Image(betas[..., c], affine, header)
+        nb.save(
+            beta_img,
+            os.path.join(outputdir, f"{prefix}_beta-{str(c+1).zfill(n_digits)}.nii.gz")
+        )
+
+    # Save R²
+    if 'R2' in results:
+        logger.info(f"Saving R2-file")
+        r2_img = nb.Nifti1Image(results['R2'], affine, header)
+        nb.save(r2_img, os.path.join(outputdir, f'{prefix}_desc-r2.nii.gz'))
+
+    # Save HRF indices
+    if 'HRFindex' in results:
+        logger.info(f"Saving HRFindex-file")
+        hrf_idx = results['HRFindex'].reshape(shape)
+        hrf_img = nb.Nifti1Image(hrf_idx.astype(np.int16), affine, header)
+        nb.save(hrf_img, os.path.join(outputdir, f'{prefix}_desc-hrfindices.nii.gz'))
+
+    # Save ridge and denoise parameters
+    if 'optparams' in results:
+        logger.info(f"Saving optparams-file")
+        denoise = results['optparams'][:, 0].reshape(shape)
+        ridge = results['optparams'][:, 1].reshape(shape)
+
+        nb.save(nb.Nifti1Image(denoise, affine, header), os.path.join(outputdir, f'{prefix}_desc-pc_count.nii.gz'))
+        nb.save(nb.Nifti1Image(ridge, affine, header), os.path.join(outputdir, f'{prefix}_desc-ridge_alpha.nii.gz'))
