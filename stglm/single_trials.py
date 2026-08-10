@@ -10,6 +10,7 @@ from math import isfinite
 from pathlib import Path
 
 import nipype.algorithms.modelgen as model
+from nipype.algorithms.confounds import TSNR
 import nipype.interfaces.utility as niu
 import numpy as np
 from nipype.interfaces.base import isdefined
@@ -20,10 +21,27 @@ from nipype.pipeline import engine as pe
 
 from .conditions import ApplyConditionOffset, ParseConditionFile
 from .tsv import FillNA
+from .qc import update_vals_with_fd, update_vals_with_mean_gm_tsnr
 
 
 def _get_scan_start(vals) -> float:
     return float(vals["scan_start"])
+
+
+def update_vals_with_number_of_volumes(vals, bold_file):
+    """Populate NumberOfVolumes from the BOLD NIfTI time dimension."""
+    import nibabel as nib
+
+    vals = dict(vals or {})
+    img = nib.load(bold_file)
+
+    if len(img.shape) < 4:
+        raise ValueError(
+            f"Expected a 4D BOLD image, got shape {img.shape}: {bold_file}"
+        )
+
+    vals["number_of_volumes"] = int(img.shape[3])
+    return vals
 
 
 def _as_bunch(subject_info):
@@ -244,7 +262,7 @@ def format_condition_bids_filenames(
         return value or "unknown"
 
     parts = []
-    for key in ["subject", "session", "task", "run", "space"]:
+    for key in ["subject", "session", "task", "run"]:
         if key in tags and tags[key] not in (None, ""):
             entity = key[:3] if key in {"subject", "session"} else key
             parts.append(f"{entity}-{safe_entity(tags[key])}")
@@ -268,6 +286,25 @@ def format_condition_bids_filenames(
 def repeat_file_to_match(in_file, items):
     return [in_file for _ in items]
 
+
+def format_tsnr_filename(tags: dict):
+    """Return a BIDS-like filename for the run-level tSNR map."""
+    import re
+
+    def safe_entity(value):
+        value = str(value)
+        value = re.sub(r"[^A-Za-z0-9+.-]+", "", value)
+        return value or "unknown"
+
+    parts = []
+    for key in ["subject", "session", "task", "run"]:
+        if key in tags and tags[key] not in (None, ""):
+            entity = key[:3] if key in {"subject", "session"} else key
+            parts.append(f"{entity}-{safe_entity(tags[key])}")
+
+    base = "_".join(parts)
+    return f"{base}_stat-tsnr_boldmap.nii.gz"
+
 def format_design_filenames(tags: dict):
     import re
 
@@ -277,7 +314,7 @@ def format_design_filenames(tags: dict):
         return value or "unknown"
 
     parts = []
-    for key in ["subject", "session", "task", "run", "space"]:
+    for key in ["subject", "session", "task", "run"]:
         if key in tags and tags[key] not in (None, ""):
             entity = key[:3] if key in {"subject", "session"} else key
             parts.append(f"{entity}-{safe_entity(tags[key])}")
@@ -297,6 +334,11 @@ def write_condition_metadata_jsons(
     events: list[list[dict]],
     estimator: str,
 ):
+    """Write condition sidecars in the flat HALFpipe statmap layout.
+
+    The condition and estimator are already represented in the BIDS-like filename,
+    so they are intentionally not duplicated as non-reference JSON fields.
+    """
     import json
     import re
     from pathlib import Path
@@ -310,14 +352,29 @@ def write_condition_metadata_jsons(
     cwd = Path.cwd()
 
     for condition, condition_events in zip(conditions, events, strict=True):
-        out_metadata = dict(metadata)
-        out_metadata.update(
+        out_metadata = dict(metadata or {})
+
+        # Keep analysis provenance separate from HALFpipe-style preprocessing
+        # settings. The branch-specific estimator belongs in each sidecar.
+        model_metadata = dict(out_metadata.get("Model") or {})
+        model_metadata["Estimator"] = estimator
+        model_metadata.setdefault("Condition", condition)
+        out_metadata["Model"] = model_metadata
+
+        # Match the reference sidecar's capitalization and event representation.
+        out_metadata["Events"] = [
             {
-                "condition": condition,
-                "estimation": estimator,
-                "events": condition_events,
+                "duration": float(event["duration"]),
+                "onset": float(event["onset"]),
+                **(
+                    {"amplitude": float(event["amplitude"])}
+                    if "amplitude" in event
+                    else {}
+                ),
             }
-        )
+            for event in condition_events
+        ]
+
         out_file = cwd / f"condition-{safe_entity(condition)}_desc-{estimator}_betas.json"
         with open(out_file, "w", encoding="utf-8") as f:
             json.dump(out_metadata, f, indent=4, ensure_ascii=False)
@@ -339,7 +396,7 @@ def format_condition_metadata_filenames(
         return value or "unknown"
 
     parts = []
-    for key in ["subject", "session", "task", "run", "space"]:
+    for key in ["subject", "session", "task", "run"]:
         if key in tags and tags[key] not in (None, ""):
             entity = key[:3] if key in {"subject", "session"} else key
             parts.append(f"{entity}-{safe_entity(tags[key])}")
@@ -351,30 +408,142 @@ def format_condition_metadata_filenames(
     ]
 
 
+
+def feature_to_model_metadata(feature):
+    """Create a JSON-safe statistical-model provenance block.
+
+    ``Setting`` is reserved for HALFpipe-style preprocessing settings. This
+    block records the single-trial model definition independently.
+    """
+    from pathlib import Path
+
+    def json_safe(value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {
+                str(key): json_safe(item)
+                for key, item in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [json_safe(item) for item in value]
+        return str(value)
+
+    source = vars(feature) if hasattr(feature, "__dict__") else dict(feature or {})
+    fields = {
+        key: json_safe(value)
+        for key, value in source.items()
+        if not key.startswith("_") and not callable(value)
+    }
+
+    preferred_names = {
+        "name": "Name",
+        "setting": "SettingName",
+        "type": "Type",
+        "conditions": "Conditions",
+        "hrf": "HRF",
+        "mode": "Mode",
+        "confounds": "Confounds",
+        "confounds_regex": "ConfoundRegex",
+        "high_pass_filter_cutoff": "HighPassFilterCutoff",
+    }
+    return {
+        preferred_names.get(key, key): value
+        for key, value in fields.items()
+    }
+
+
 def collect_base_metadata(
     tags,
     vals,
+    metadata,
     Conditions,
     ConditionFile,
     ConditionUnits,
     BasedOn,
+    Model,
 ):
-    """Create run-level metadata without legacy TrialList entries.
+    """Build a flat HALFpipe-like statmap metadata object.
 
-    Per-condition beta sidecars receive their condition-specific ``events`` list
-    downstream, matching HALFpipe's single-trial resultdict metadata semantics.
+    Upstream metadata and run values are retained, common snake_case aliases are
+    normalized to the capitalization used by HALFpipe, and workflow bookkeeping
+    fields that are absent from the reference sidecar are omitted.
     """
-    metadata = {
-        "Sources": BasedOn,
-        "Conditions": Conditions,
-        "ConditionFile": ConditionFile,
-        "ConditionUnits": ConditionUnits,
+    canonical_keys = {
+        "acquisition_orientation": "AcquisitionOrientation",
+        "acquisition_volume_shape": "AcquisitionVolumeShape",
+        "acquisition_voxel_size": "AcquisitionVoxelSize",
+        "confound_regressors": "ConfoundRegressors",
+        "dummy_scans": "DummyScans",
+        "fd_max": "FDMax",
+        "fd_mean": "FDMean",
+        "fd_perc": "FDPerc",
+        "fallback_registration": "FallbackRegistration",
+        "halfpipe_version": "HALFpipeVersion",
+        "mean_gm_tsnr": "MeanGMTSNR",
+        "model": "Model",
+        "number_of_volumes": "NumberOfVolumes",
+        "raw_sources": "RawSources",
+        "repetition_time": "RepetitionTime",
+        "scan_start": "ScanStart",
+        "setting": "Setting",
+        "task_name": "TaskName",
     }
-    if isinstance(vals, dict):
-        metadata.update(vals)
+
+    out = {}
+    for source in (metadata, vals):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if value is None:
+                continue
+            out[canonical_keys.get(key, key)] = value
+
+    if isinstance(Model, dict) and Model:
+        existing_model = dict(out.get("Model") or {})
+        existing_model.update(Model)
+        out["Model"] = existing_model
+
+    # Prefer an existing RawSources list; otherwise compose it from known inputs.
+    raw_sources = out.get("RawSources", [])
+    if isinstance(raw_sources, str):
+        raw_sources = [raw_sources]
+    elif not isinstance(raw_sources, list):
+        raw_sources = list(raw_sources) if raw_sources else []
+
+    for source in (ConditionFile, BasedOn):
+        if source is None:
+            continue
+        values = source if isinstance(source, (list, tuple)) else [source]
+        for value in values:
+            if value not in raw_sources:
+                raw_sources.append(value)
+    if raw_sources:
+        out["RawSources"] = raw_sources
+
     if isinstance(tags, dict):
-        metadata["Tags"] = tags
-    return metadata
+        task = tags.get("task")
+        if task and "TaskName" not in out:
+            out["TaskName"] = task
+        space = tags.get("space")
+        if space:
+            setting = dict(out.get("Setting") or {})
+            setting.setdefault("Space", space)
+            out["Setting"] = setting
+
+    # These describe parsing/model setup rather than the reference statmap metadata.
+    out.pop("Conditions", None)
+    out.pop("ConditionFile", None)
+    out.pop("ConditionUnits", None)
+    out.pop("Sources", None)
+    out.pop("Tags", None)
+    out.pop("events", None)
+    out.pop("condition", None)
+    out.pop("estimation", None)
+    return out
 
 
 def select_first(in_files):
@@ -413,6 +582,11 @@ def init_singletrials_wf(
     condition_files,
     condition_units,
     confound_file=None,
+    confounds_file=None,
+    gm_probseg=None,
+    fd_threshold=0.2,
+    tsnr_regress_poly=2,
+    gm_threshold=0.5,
     derivatives=None,
 ):
     """
@@ -434,6 +608,8 @@ def init_singletrials_wf(
                 "mask",
                 "repetition_time",
                 "confounds_selected",
+                "confounds_file",
+                "gm_probseg",
                 "condition_names",
                 "condition_files",
                 "condition_units",
@@ -445,6 +621,8 @@ def init_singletrials_wf(
     inputnode.inputs.condition_files = condition_files
     inputnode.inputs.condition_units = condition_units
     inputnode.inputs.confounds_selected = confound_file
+    inputnode.inputs.confounds_file = confounds_file
+    inputnode.inputs.gm_probseg = gm_probseg
 
     outputnode = pe.Node(
         niu.IdentityInterface(
@@ -459,6 +637,7 @@ def init_singletrials_wf(
                 "lss_metadata",
                 "lsa_masks",
                 "lss_masks",
+                "tsnr_map",
             ]
         ),
         name="outputnode",
@@ -485,20 +664,80 @@ def init_singletrials_wf(
 
     fillna = pe.Node(FillNA(), name="fillna")
 
+    update_fd_vals = pe.Node(
+        niu.Function(
+            input_names=["vals", "confounds_file", "fd_thres"],
+            output_names=["vals"],
+            function=update_vals_with_fd,
+        ),
+        name="update_vals_with_fd",
+    )
+    update_fd_vals.inputs.fd_thres = float(fd_threshold)
+
+    tsnr = pe.Node(
+        TSNR(regress_poly=int(tsnr_regress_poly)),
+        name="tsnr",
+    )
+    tsnr.inputs.tsnr_file = "tsnr.nii.gz"
+    tsnr.inputs.mean_file = "mean.nii.gz"
+    tsnr.inputs.stddev_file = "stdev.nii.gz"
+    tsnr.inputs.detrended_file = "detrended.nii.gz"
+
+    format_tsnr_name = pe.Node(
+        niu.Function(
+            input_names=["tags"],
+            output_names=["out_name"],
+            function=format_tsnr_filename,
+        ),
+        name="format_tsnr_name",
+    )
+    rename_tsnr = pe.Node(
+        niu.Rename(keep_ext=False),
+        name="rename_tsnr",
+    )
+
+    update_gm_tsnr_vals = pe.Node(
+        niu.Function(
+            input_names=[
+                "vals",
+                "tsnr_file",
+                "gm_probseg_file",
+                "mask_file",
+                "gm_threshold",
+            ],
+            output_names=["vals"],
+            function=update_vals_with_mean_gm_tsnr,
+        ),
+        name="update_vals_with_mean_gm_tsnr",
+    )
+    update_gm_tsnr_vals.inputs.gm_threshold = float(gm_threshold)
+
     base_metadata = pe.Node(
         niu.Function(
             input_names=[
                 "tags",
                 "vals",
+                "metadata",
                 "Conditions",
                 "ConditionFile",
                 "ConditionUnits",
                 "BasedOn",
+                "Model",
             ],
             output_names=["metadata"],
             function=collect_base_metadata,
         ),
         name="base_metadata",
+    )
+    base_metadata.inputs.Model = feature_to_model_metadata(feature)
+
+    update_nvols_vals = pe.Node(
+        niu.Function(
+            input_names=["vals", "bold_file"],
+            output_names=["vals"],
+            function=update_vals_with_number_of_volumes,
+        ),
+        name="update_vals_with_number_of_volumes",
     )
 
     # ------------------------------------------------------------------
@@ -745,6 +984,28 @@ def init_singletrials_wf(
             (fillna, spec_lss, [("out_no_header", "realignment_parameters")]),
         ])
 
+    # Build the HALFpipe-like vals chain. FD uses the original fMRIPrep
+    # confounds TSV. tSNR is computed from the same BOLD series used by the GLM.
+    vals_source = inputnode
+    vals_output = "vals"
+    if confounds_file is not None:
+        workflow.connect(inputnode, "vals", update_fd_vals, "vals")
+        workflow.connect(inputnode, "confounds_file", update_fd_vals, "confounds_file")
+        vals_source = update_fd_vals
+
+    if gm_probseg is not None:
+        workflow.connect(inputnode, "bold", tsnr, "in_file")
+        workflow.connect(vals_source, vals_output, update_gm_tsnr_vals, "vals")
+        workflow.connect(tsnr, "tsnr_file", update_gm_tsnr_vals, "tsnr_file")
+        workflow.connect(inputnode, "gm_probseg", update_gm_tsnr_vals, "gm_probseg_file")
+        workflow.connect(inputnode, "mask", update_gm_tsnr_vals, "mask_file")
+        vals_source = update_gm_tsnr_vals
+
+    workflow.connect(vals_source, vals_output, update_nvols_vals, "vals")
+    workflow.connect(inputnode, "bold", update_nvols_vals, "bold_file")
+
+    workflow.connect(update_nvols_vals, "vals", base_metadata, "vals")
+
     workflow.connect([
         # General parsing and timing
         (inputnode, parse_condition_file, [
@@ -756,7 +1017,7 @@ def init_singletrials_wf(
         (get_scan_start, apply_condition_offset, [("scan_start", "scan_start")]),
         (inputnode, base_metadata, [
             ("tags", "tags"),
-            ("vals", "vals"),
+            ("metadata", "metadata"),
             ("condition_names", "Conditions"),
             ("condition_files", "ConditionFile"),
             ("condition_units", "ConditionUnits"),
@@ -764,6 +1025,9 @@ def init_singletrials_wf(
         ]),
         (inputnode, get_sink_paths, [("tags", "tags")]),
         (inputnode, format_design_names, [("tags", "tags")]),
+        (inputnode, format_tsnr_name, [("tags", "tags")]),
+        (tsnr, rename_tsnr, [("tsnr_file", "in_file")]),
+        (format_tsnr_name, rename_tsnr, [("out_name", "format_string")]),
 
         # LSA design/model
         (apply_condition_offset, cond2lsa, [("subject_info", "subject_info")]),
@@ -843,6 +1107,7 @@ def init_singletrials_wf(
         (rename_lss_metadata, outputnode, [("out_file", "lss_metadata")]),
         (rename_lsa_masks, outputnode, [("out_file", "lsa_masks")]),
         (rename_lss_masks, outputnode, [("out_file", "lss_masks")]),
+        (rename_tsnr, outputnode, [("out_file", "tsnr_map")]),
         (group_lsa, outputnode, [("conditions", "lsa_conditions"), ("events", "lsa_events")]),
         (group_lss, outputnode, [("conditions", "lss_conditions"), ("events", "lss_events")]),
 
@@ -859,6 +1124,9 @@ def init_singletrials_wf(
         (rename_lsa_masks, datasink, [("out_file", "func.task.@lsa_masks")]),
         (rename_lss_masks, datasink, [("out_file", "func.task.@lss_masks")]),
         (rename_designs, datasink, [("out_file", "func.task.@designs")]),
+
+        # Run-level QC belongs in the parent func directory.
+        (rename_tsnr, datasink, [("out_file", "func.@tsnr")]),
     ])
 
     return workflow

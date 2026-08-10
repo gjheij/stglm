@@ -24,6 +24,44 @@ from stglm.events import get_event_names
 logger = get_logger(__name__)
 opj = os.path.join
 
+def _entity_match(reference, candidate, keys=(
+    "subject", "session", "task", "acquisition", "run", "echo", "space", "resolution"
+)):
+    """Return True when all entities shared by two BIDS files agree."""
+    ref_entities = reference.entities
+    cand_entities = candidate.entities
+    for key in keys:
+        ref_value = ref_entities.get(key)
+        cand_value = cand_entities.get(key)
+        if ref_value is not None and cand_value is not None and str(ref_value) != str(cand_value):
+            return False
+    return True
+
+
+def _find_bids_match(reference, candidates, label, required=True):
+    matches = [candidate for candidate in candidates if _entity_match(reference, candidate)]
+    if not matches:
+        if required:
+            raise FileNotFoundError(f"No matching {label} for {reference.path}")
+        return None
+    if len(matches) > 1:
+        # Prefer the candidate sharing the largest number of concrete entities.
+        def score(candidate):
+            return sum(
+                reference.entities.get(key) is not None
+                and candidate.entities.get(key) is not None
+                and str(reference.entities[key]) == str(candidate.entities[key])
+                for key in ("session", "task", "acquisition", "run", "echo", "space", "resolution")
+            )
+        matches.sort(key=score, reverse=True)
+        if len(matches) > 1 and score(matches[0]) == score(matches[1]):
+            raise ValueError(
+                f"Ambiguous {label} match for {reference.path}: "
+                f"{[candidate.path for candidate in matches if score(candidate) == score(matches[0])]}"
+            )
+    return matches[0]
+
+
 def build_inputs(
     layout,
     subject,
@@ -34,162 +72,167 @@ def build_inputs(
     confounds_suffix="timeseries",
     no_confounds=False,
     evs=None,
-    glm_kws={},
-    **kwargs
+    glm_kws=None,
+    gm_probseg_threshold=0.5,
+    **kwargs,
 ):
+    """Build run inputs and attach fMRIPrep GM probability maps.
 
+    tSNR is intentionally not queried from the derivatives because fMRIPrep does
+    not normally emit it. It is computed later from each run's BOLD image.
+    """
+    glm_kws = dict(glm_kws or {})
     if glm_single:
         no_confounds = True
 
     bold_files = layout.get(
-        subject=subject,
-        task=task,
-        desc=desc,
-        suffix='bold',
-        extension='nii.gz',
-        return_type='object',
-        **kwargs
+        subject=subject, task=task, desc=desc, suffix="bold",
+        extension="nii.gz", return_type="object", **kwargs
     )
-
     if not bold_files:
         raise FileNotFoundError(f"No bold files found for sub-{subject}")
-    
-    mask_files = layout.get(
-        subject=subject,
-        task=task,
-        suffix='mask',
-        extension='nii.gz',
-        return_type='file',
-        **kwargs
-    )
 
+    mask_files = layout.get(
+        subject=subject, task=task, suffix="mask", extension="nii.gz",
+        return_type="object", **kwargs
+    )
+    if not mask_files:
+        raise FileNotFoundError(f"No masks found for sub-{subject}")
+
+    confounds = []
     if not no_confounds:
         confounds = layout.get(
-            subject=subject,
-            task=task,
-            suffix=confounds_suffix,
-            extension='tsv',
-            return_type='file'
+            subject=subject, task=task, suffix=confounds_suffix,
+            extension="tsv", return_type="object"
         )
-
         if not confounds:
             raise FileNotFoundError(f"No confounds found for sub-{subject}")
-        else:
-            logger.info(f"Found {len(confounds)} files with suffix='{confounds_suffix}'")
-    else:
-        confounds = None
+        logger.info("Found %d files with suffix='%s'", len(confounds), confounds_suffix)
 
     events = layout.get(
-        subject=subject,
-        task=task,
-        suffix='events',
-        extension='tsv',
-        return_type='file'
+        subject=subject, task=task, suffix="events", extension="tsv",
+        return_type="object"
     )
-
     if not events:
         raise FileNotFoundError(f"No events found for sub-{subject}")
 
-    entities = bold_files[0].entities
-    tr = entities["RepetitionTime"]
+    # fMRIPrep/sMRIPrep normally provides label-GM_probseg in anatomical or
+    # standard space. The QC helper resamples it to each BOLD/tSNR grid.
+    gm_probsegs = layout.get(
+        subject=subject, label="GM", suffix="probseg", extension="nii.gz",
+        return_type="object", **kwargs
+    )
+    if not gm_probsegs:
+        # Avoid task/desc restrictions inherited through kwargs for anatomical maps.
+        gm_probsegs = layout.get(
+            subject=subject, label="GM", suffix="probseg", extension="nii.gz",
+            return_type="object"
+        )
+    if not gm_probsegs and not glm_single:
+        raise FileNotFoundError(
+            f"No label-GM_probseg found for sub-{subject}; required for MeanGMTSNR"
+        )
 
-    if not glm_single:
-        if run_mode == "concat":
-            logger.info(f"Estimation mode = {run_mode}; concatenating all runs")
-            merged_bold = utils.merge_bold(
-                [i.path for i in bold_files]
-            )
+    first_metadata = layout.get_metadata(bold_files[0].path)
+    tr = bold_files[0].entities.get("RepetitionTime") or first_metadata.get("RepetitionTime")
+    if tr is None:
+        raise ValueError(f"RepetitionTime is unavailable for {bold_files[0].path}")
 
-            if not no_confounds:
-                merged_confounds = utils.merge_confounds(
-                    confounds,
-                    out_file="/tmp/merged_confounds.tsv"
-                )
-            else:
-                merged_confounds = None
-
-            merged_events = utils.merge_events(
-                events,
-                bold_files,
-                tr,
-                out_file="/tmp/merged_events.tsv"
-            )
-
-            if evs is None:
-                evs = get_event_names(merged_events)
-
-            logger.info(f"Including events = {evs}")
-            try:
-                entities.pop("run")
-            except:
-                pass
-            
-            return [{
-                "bold": merged_bold,
-                "mask": mask_files[0],
-                "confounds": merged_confounds,
-                "events": merged_events,
-                "tags": entities,
-                "tr": tr,
-                "conditions": evs
-            }]
-        
-        elif run_mode == "loop":
-            logger.info(f"Estimation mode = {run_mode}; performing run-wise trial estimation")
-            all_runs = []
-            for i in range(len(bold_files)):
-
-                if evs is None:
-                    use_evs = get_event_names(events[i])
-                else:
-                    use_evs = evs
-            
-                logger.info(f"Including events = {use_evs} for run {i+1}/{len(bold_files)}")
-                all_runs.append({
-                    "bold": bold_files[i].path,
-                    "mask": mask_files[i] if len(mask_files) > 1 else mask_files[0],
-                    "confounds": confounds[i] if confounds is not None else None,
-                    "events": events[i],
-                    "tags": bold_files[i].entities,
-                    "tr": tr,
-                    "conditions": use_evs
-                })
-
-            return all_runs
-        else:
-            raise ValueError(f"Unknown run_mode: {run_mode}")
-    else:
+    if glm_single:
         return {
-            "bold_files": [i.path for i in bold_files],
-            "event_files": events,
+            "bold_files": [item.path for item in bold_files],
+            "event_files": [item.path for item in events],
             "tr": tr,
             "params": glm_kws,
-            "tags": bold_files[0].entities
+            "tags": dict(bold_files[0].entities),
         }
 
-def run_stglm_from_inputs(
-        run_data_list,
-        feature,
-        workdir,
-        confound_regexes=None,
-        n_procs=1,
-        derivatives=None,
-        clean_run=False
-    ):
+    if run_mode == "concat":
+        logger.info("Estimation mode = concat; concatenating all runs")
+        merged_bold = utils.merge_bold([item.path for item in bold_files])
+        merged_confounds = None if no_confounds else utils.merge_confounds(
+            [item.path for item in confounds], out_file="/tmp/merged_confounds.tsv"
+        )
+        merged_events = utils.merge_events(
+            [item.path for item in events], bold_files, tr,
+            out_file="/tmp/merged_events.tsv"
+        )
+        use_evs = get_event_names(merged_events) if evs is None else evs
+        tags = dict(bold_files[0].entities)
+        tags.pop("run", None)
+        gm_probseg = _find_bids_match(bold_files[0], gm_probsegs, "GM probability map")
+        return [{
+            "bold": merged_bold,
+            "mask": _find_bids_match(bold_files[0], mask_files, "mask").path,
+            "confounds": merged_confounds,
+            "events": merged_events,
+            "tags": tags,
+            "tr": tr,
+            "conditions": use_evs,
+            "gm_probseg": gm_probseg.path,
+            "gm_threshold": float(gm_probseg_threshold),
+            "metadata": first_metadata,
+            "vals": {"scan_start": 0.0},
+        }]
 
+    if run_mode != "loop":
+        raise ValueError(f"Unknown run_mode: {run_mode}")
+
+    logger.info("Estimation mode = loop; performing run-wise trial estimation")
+    all_runs = []
+    for index, bold_file in enumerate(bold_files, start=1):
+        event_file = _find_bids_match(bold_file, events, "events file")
+        mask_file = _find_bids_match(bold_file, mask_files, "mask")
+        confound_file = _find_bids_match(
+            bold_file, confounds, "confounds file", required=not no_confounds
+        )
+        gm_probseg = _find_bids_match(bold_file, gm_probsegs, "GM probability map")
+        metadata = layout.get_metadata(bold_file.path)
+        run_tr = bold_file.entities.get("RepetitionTime") or metadata.get("RepetitionTime") or tr
+        use_evs = get_event_names(event_file.path) if evs is None else evs
+        logger.info("Including events = %s for run %d/%d", use_evs, index, len(bold_files))
+        all_runs.append({
+            "bold": bold_file.path,
+            "mask": mask_file.path,
+            "confounds": confound_file.path if confound_file is not None else None,
+            "events": event_file.path,
+            "tags": dict(bold_file.entities),
+            "tr": run_tr,
+            "conditions": use_evs,
+            "gm_probseg": gm_probseg.path,
+            "gm_threshold": float(gm_probseg_threshold),
+            "metadata": metadata,
+            "vals": {"scan_start": 0.0},
+        })
+    return all_runs
+
+def run_stglm_from_inputs(
+    run_data_list,
+    feature,
+    workdir,
+    confound_regexes=None,
+    n_procs=1,
+    derivatives=None,
+    clean_run=False,
+    fd_threshold=0.2,
+    tsnr_regress_poly=2,
+):
+    """Run the single-trial GLM workflow for each run.
+
+    tSNR is computed inside the Nipype workflow from each run BOLD image.
+    """
     results = []
+
     for run in run_data_list:
-        
         tags = run["tags"]
 
         sub_id = f"sub_{tags['subject']}"
-        ses_id = f"ses_{tags['session']}" if "session" in tags else None
-        run_id = f"run_{tags['run']}" if "run" in tags else None
-        task_id = f"task_{tags['task']}" if "task" in tags else None
+        ses_id = f"ses_{tags['session']}" if tags.get("session") else None
+        run_id = f"run_{tags['run']}" if tags.get("run") else None
+        task_id = f"task_{tags['task']}" if tags.get("task") else None
 
-
-        # Build BIDS-style workflow path
-        bold_prefix = f"bold"
+        # Build the workflow working-directory hierarchy.
+        bold_prefix = "bold"
         if ses_id:
             bold_prefix += f"_{ses_id}"
         if task_id:
@@ -208,61 +251,119 @@ def run_stglm_from_inputs(
         )
 
         if clean_run:
-            logger.warning(f"Removing all directories under '{str(workdir_i)}'")
+            logger.warning(
+                "Removing all directories under '%s'",
+                workdir_i,
+            )
             shutil.rmtree(workdir_i, ignore_errors=True)
 
-        if run["confounds"] is not None:
+        full_confounds_tsv = run.get("confounds")
+        selected_confounds_tsv = None
+
+        if full_confounds_tsv is not None:
             if confound_regexes is not None:
-                logger.info("Running confound workflow")
+                logger.info("Running confound selection workflow")
+
                 conf_wf = init_confounds_select_wf()
-                conf_wf.base_dir = workdir_i
+                conf_wf.base_dir = str(workdir_i)
 
                 conf_input = conf_wf.get_node("inputnode").inputs
                 conf_input.bold = run["bold"]
-                conf_input.tags = run["tags"]
+                conf_input.tags = tags
                 conf_input.mask = run["mask"]
-                conf_input.confounds = run["confounds"]
+                conf_input.confounds = full_confounds_tsv
                 conf_input.confound_names = confound_regexes
 
                 conf_result = conf_wf.run()
-                conf_tsv = utils.get_node_by_name(conf_result, "selectcolumns").result.outputs.out_with_header
-            else:
-                conf_tsv = run["confounds"]
-                logger.info(f"Confound file: '{conf_tsv}'")
-        else:
-            conf_tsv = None
+                selectcolumns = utils.get_node_by_name(
+                    conf_result,
+                    "selectcolumns",
+                )
+                selected_confounds_tsv = (
+                    selectcolumns.result.outputs.out_with_header
+                )
 
-        # add conditions to feature
+                logger.info(
+                    "Selected confound file: '%s'",
+                    selected_confounds_tsv,
+                )
+            else:
+                # Preserve the existing behavior: use the full confounds
+                # table as the model nuisance-regressor input.
+                selected_confounds_tsv = full_confounds_tsv
+                logger.info(
+                    "Confound file: '%s'",
+                    selected_confounds_tsv,
+                )
+
+        # Conditions may differ by run.
         setattr(feature, "conditions", run["conditions"])
 
-        # Run single-trials
         stglm_wf = init_singletrials_wf(
             condition_files=run["events"],
             condition_units="secs",
             feature=feature,
             workdir=workdir_i,
             derivatives=derivatives,
-            confound_file=conf_tsv
+
+            # Selected regressors used by SpecifyModel.
+            confound_file=selected_confounds_tsv,
+
+            # Full confounds table used for framewise-displacement metrics.
+            confounds_file=full_confounds_tsv,
+
+            # tSNR is computed from BOLD; GM is defined by fMRIPrep probseg.
+            gm_probseg=run.get("gm_probseg"),
+            gm_threshold=float(run.get("gm_threshold", 0.5)),
+            fd_threshold=float(fd_threshold),
+            tsnr_regress_poly=int(tsnr_regress_poly),
         )
-        stglm_wf.base_dir = workdir_i
-        
+        stglm_wf.base_dir = str(workdir_i)
+
         st_input = stglm_wf.get_node("inputnode").inputs
         st_input.bold = run["bold"]
         st_input.mask = run["mask"]
         st_input.repetition_time = run["tr"]
-        st_input.tags = run["tags"]
-        st_input.vals = {"scan_start": 0.0}
-        
-        kwargs = {}
-        if n_procs > 1:
-            kwargs = {
-                "plugin": "MultiProc",
-                "plugin_args": {
-                    "n_procs": n_procs
-                }
+        st_input.tags = tags
+
+        vals = dict(run.get("vals") or {})
+        vals.setdefault("scan_start", 0.0)
+
+        # Preserve preprocessing provenance separately from the Model block.
+        # Only report settings that this CLI can establish from the actual run.
+        setting = dict(vals.get("setting") or {})
+        setting["Space"] = tags.get("space") or "native"
+        setting["ConfoundsRemoval"] = list(confound_regexes or [])
+        setting["ICAAROMA"] = bool(
+            getattr(feature, "confounds", None) == "ICA-AROMA"
+            or any(regex == "ICA-AROMA" for regex in (confound_regexes or []))
+        )
+
+        high_pass_cutoff = getattr(feature, "high_pass_filter_cutoff", None)
+        if high_pass_cutoff is not None and np.isfinite(high_pass_cutoff):
+            setting["BandpassFilter"] = {
+                "HighPassWidth": float(high_pass_cutoff),
+                "LowPassWidth": None,
+                "Type": "gaussian",
             }
 
-        result = stglm_wf.run(**kwargs)
+        vals["setting"] = setting
+        st_input.vals = vals
+
+        metadata = run.get("metadata")
+        if metadata is not None:
+            st_input.metadata = metadata
+
+        run_kwargs = {}
+        if n_procs > 1:
+            run_kwargs = {
+                "plugin": "MultiProc",
+                "plugin_args": {
+                    "n_procs": n_procs,
+                },
+            }
+
+        result = stglm_wf.run(**run_kwargs)
         results.append(result)
 
     return results
@@ -553,12 +654,52 @@ For more custom implementation, this package might not be for you.
         help='Stimulus duration (default = 0) for GLMsingle'
     )
 
+    parser.add_argument(
+        '--fd-threshold',
+        type=float,
+        default=0.2,
+        help='Framewise-displacement threshold in millimetres used for FDPerc (default = 0.2)'
+    )
+
+    parser.add_argument(
+        '--gm-threshold',
+        type=float,
+        default=0.5,
+        help='Threshold applied to the fMRIPrep GM probability map for MeanGMTSNR (default = 0.5)'
+    )
+
+    parser.add_argument(
+        '--tsnr-regress-poly',
+        type=int,
+        default=2,
+        help='Polynomial detrending order used when computing tSNR (default = 2)'
+    )
+
+    parser.add_argument(
+        '--high-pass-filter-cutoff',
+        type=float,
+        default=None,
+        help='Optional FSL high-pass cutoff in seconds. Omit to retain the workflow default.'
+    )
+
     return parser.parse_args()
 
 def main():
 
     logger.info("Starting single-trial GLM workflow")
     args = args_parser()
+
+    if args.fd_threshold < 0:
+        raise ValueError("--fd-threshold must be non-negative")
+    if not 0.0 <= args.gm_threshold <= 1.0:
+        raise ValueError("--gm-threshold must be between 0 and 1")
+    if args.tsnr_regress_poly < 0:
+        raise ValueError("--tsnr-regress-poly must be non-negative")
+    if (
+        args.high_pass_filter_cutoff is not None
+        and args.high_pass_filter_cutoff <= 0
+    ):
+        raise ValueError("--high-pass-filter-cutoff must be positive")
 
     space = args.space
     space_kwargs = {} if space == "func" else {"space": space}
@@ -601,6 +742,7 @@ def main():
         confounds_suffix=args.confounds_suffix,
         glm_kws=glm_kws,
         evs=args.evs,
+        gm_probseg_threshold=args.gm_threshold,
         **space_kwargs
     )
 
@@ -652,11 +794,18 @@ def main():
             logger.info("Not including any confounds; assuming data is already treated properly..")
 
         ddict = {
+            "name": "SingleTrials",
+            "setting": "SingleTrialsSetting",
+            "type": "single_trials",
             "hrf": args.hrf,
             "mode": args.lss_mode,
             "confounds": confound_subtype,
             "confounds_regex": confound_regexes,
         }
+        if args.high_pass_filter_cutoff is not None:
+            ddict["high_pass_filter_cutoff"] = float(
+                args.high_pass_filter_cutoff
+            )
 
         feature = SimpleNamespace(**ddict)
         _ = run_stglm_from_inputs(
@@ -666,7 +815,9 @@ def main():
             confound_regexes=confound_regexes,
             n_procs=int(args.n_procs),
             derivatives=str(derivatives_dir),
-            clean_run=args.clean
+            clean_run=args.clean,
+            fd_threshold=args.fd_threshold,
+            tsnr_regress_poly=args.tsnr_regress_poly,
         )
     else:
 
