@@ -7,3 +7,4 @@ stglm/__pycache__/
 .DS_Store
 stglm/version.py
 build/*
+crash*
