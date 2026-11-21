@@ -2,6 +2,7 @@
 import importlib.util
 import ast
 import logging
+import shutil
 import json
 from pathlib import Path
 import sys
@@ -103,7 +104,15 @@ class Runs(unittest.TestCase):
         class Engine:
             def __init__(inner,params):
                 self.engine_params=params
+                self.engine_calls=getattr(self,'engine_calls',0)+1
             def fit(inner,designs,data,duration,tr,outputdir,figuredir):
+                # Reproduce the real SDK's destructive initialization, including
+                # removal of any diagnostic files written inside outputdir.
+                shutil.rmtree(outputdir)
+                Path(outputdir).mkdir()
+                order=[int(np.flatnonzero(row)[0]) for design in designs for row in design if row.any()]
+                np.save(Path(outputdir)/'DESIGNINFO.npy',dict(design=designs,tr=tr,stimdur=duration,
+                    stimorder=order,numtrialrun=[int(d.sum()) for d in designs],params=self.engine_params))
                 count=sum(design.sum() for design in designs)
                 arrays=np.stack([np.full(data[0].shape[:3],i,dtype=np.float32) for i in range(count)],axis=-1)
                 for name in ['TYPEB_FITHRF.npy','TYPED_FITHRF_GLMDENOISE_RR.npy']:
@@ -114,7 +123,7 @@ class Runs(unittest.TestCase):
                 nib.save(nib.Nifti1Image(arrays[...,i],np.eye(4)),Path(outputdir)/f'{prefix}_beta-{i+1:0{digits}d}.nii.gz')
         engine_module=types.ModuleType('glmsingle.glmsingle');engine_module.GLM_single=Engine
         parent=types.ModuleType('glmsingle');parent.glmsingle=engine_module
-        package=types.ModuleType('stglm');package.utils=types.SimpleNamespace(save_glmsingle_outputs=save)
+        package=types.ModuleType('stglm');package.__path__=[str(ROOT/'stglm')];package.utils=types.SimpleNamespace(save_glmsingle_outputs=save)
         with patch.dict(sys.modules,{'glmsingle':parent,'glmsingle.glmsingle':engine_module,'stglm':package}):
             return io.fit_glmsingle(self.bold,self.events,2.,output_dir=self.root/'output',params={'wantfileoutputs':[1,1,1,1]}, **kwargs)
 
@@ -193,6 +202,136 @@ class Runs(unittest.TestCase):
         self.assertEqual(len(result[-1]['excluded_events']),10)
         self.assertNotIn('outside',result[4])
         self.assertEqual(result[-1]['run_summary'].retained_events.tolist(),[118,1])
+
+    def test_diagnostics_and_external_lock_survive_sdk_output_reset(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        for name in ['excluded_events.tsv','late_events.tsv','run_summary.tsv','fit_provenance.json']:
+            self.assertTrue((folder/name).is_file(),name)
+        self.assertTrue((folder.parent/('.'+folder.name+'.fit_input.json')).is_file())
+        self.assertTrue((folder.parent/('.'+folder.name+'.fit.lock')).is_file())
+        self.assertFalse((folder/'.fit.lock').exists())
+
+    def test_export_only_recovers_without_fitting_or_loading_bold(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        (folder/'fit_provenance.json').unlink()
+        (folder/'excluded_events.tsv').unlink()
+        calls=self.engine_calls
+        with patch.object(nib.Nifti1Image,'get_fdata',side_effect=AssertionError('export must not load BOLD arrays')):
+            recovered=self.fit_stub(export_only=True)
+        self.assertEqual(self.engine_calls,calls)
+        self.assertEqual(recovered,results)
+        self.assertTrue((folder/'excluded_events.tsv').is_file())
+        saved=json.loads((folder/'fit_provenance.json').read_text())
+        self.assertEqual(saved['recovery_validation'],'original_input_plan')
+
+    def test_legacy_export_recovery_records_missing_input_history(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        (folder/'fit_provenance.json').unlink()
+        (folder.parent/('.'+folder.name+'.fit_input.json')).unlink()
+        calls=self.engine_calls
+        self.fit_stub(export_only=True)
+        self.assertEqual(self.engine_calls,calls)
+        saved=json.loads((folder/'fit_provenance.json').read_text())
+        self.assertEqual(saved['recovery_validation'],'saved_design_only_legacy_input_history_unavailable')
+
+    def qc_inputs(self):
+        mask=self.root/'mask.nii.gz';gm=self.root/'gm.nii.gz'
+        nib.save(nib.Nifti1Image(np.ones((2,2,2),dtype=np.uint8),np.eye(4)),mask)
+        nib.save(nib.Nifti1Image(np.ones((2,2,2),dtype=np.float32),np.eye(4)),gm)
+        records=[]
+        for bold,length in zip(self.bold,[7,9]):
+            fd=self.root/(Path(bold).name+'.fd.tsv')
+            pd.DataFrame({'framewise_displacement':[np.nan]+[.3]*(length-1)}).to_csv(fd,sep='\t',index=False)
+            records.append(dict(bold=bold,tr=2.,mask=str(mask),gm_probseg=str(gm),fd_confounds=str(fd),metadata={'TaskName':'test'}))
+        return records
+
+    def test_completed_fit_qc_enrichment_reuses_raw_models_and_voxel_maps(self):
+        results=self.fit_stub();calls=self.engine_calls
+        folder=Path(results['typed'][0]).parent
+        image=Path(results['typed'][0]);before=image.stat().st_mtime_ns
+        records=self.qc_inputs()
+        with patch.object(nib.Nifti1Image,'get_fdata',side_effect=AssertionError('QC export must not load full BOLD arrays')):
+            self.fit_stub(export_only=True,split_trial_types=True,qc_runs=records)
+        self.assertEqual(self.engine_calls,calls)
+        self.assertEqual(image.stat().st_mtime_ns,before)
+        individual=json.loads(Path(str(image).replace('.nii.gz','.json')).read_text())
+        condition_path=next((folder/'conditionwise/model-typed').glob('*.json'))
+        condition=json.loads(condition_path.read_text())
+        for metadata in [individual,condition]:
+            self.assertEqual(metadata['QCStatus'],'complete')
+            self.assertIn('MeanGMTSNR',metadata)
+            self.assertEqual(metadata['FDPerc'],100.)
+            self.assertEqual(metadata['ConfoundRegressors'],[])
+            self.assertTrue(Path(metadata['TSNRFile']).is_file())
+            self.assertTrue(metadata['Model']['GLMdenoise'])
+        self.assertEqual(len(list((folder/'qc').glob('*_stat-tsnr_statmap.nii.gz'))),2)
+        self.assertTrue((folder.parent/('.'+folder.name+'.previous_export.json')).is_file())
+        saved=json.loads((folder/'fit_provenance.json').read_text())
+        self.assertEqual(saved['qc_status'],{'0':'complete','1':'complete'})
+
+    def test_qc_failure_does_not_leave_a_false_success_marker(self):
+        results=self.fit_stub();calls=self.engine_calls
+        folder=Path(results['typed'][0]).parent
+        records=self.qc_inputs()
+        # Invalid QC-only rows must not force refitting or leave success behind.
+        pd.DataFrame({'framewise_displacement':[.1]}).to_csv(records[0]['fd_confounds'],sep='\t',index=False)
+        with self.assertRaisesRegex(ValueError,'row count'):
+            self.fit_stub(export_only=True,qc_runs=records)
+        self.assertFalse((folder/'fit_provenance.json').exists())
+        self.assertTrue((folder/'TYPED_FITHRF_GLMDENOISE_RR.npy').exists())
+        self.assertEqual(self.engine_calls,calls)
+        records=self.qc_inputs()
+        self.fit_stub(export_only=True,qc_runs=records)
+        self.assertTrue((folder/'fit_provenance.json').exists())
+        self.assertEqual(self.engine_calls,calls)
+
+    def test_export_only_can_add_conditionwise_files_to_complete_export(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        before=Path(results['typed'][0]).stat().st_mtime_ns
+        calls=self.engine_calls
+        self.fit_stub(export_only=True,split_trial_types=True)
+        self.assertEqual(self.engine_calls,calls)
+        self.assertEqual(Path(results['typed'][0]).stat().st_mtime_ns,before)
+        self.assertTrue(list((folder/'conditionwise/model-typed').glob('*.nii.gz')))
+
+    def test_export_recovery_rejects_changed_saved_design(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        (folder/'fit_provenance.json').unlink()
+        (folder.parent/('.'+folder.name+'.fit_input.json')).unlink()
+        path=folder/'DESIGNINFO.npy';info=np.load(path,allow_pickle=True).item()
+        info['design'][0][0]=0;np.save(path,info)
+        with self.assertRaisesRegex(ValueError,'design/TR/duration'):self.fit_stub(export_only=True)
+        self.assertFalse((folder/'fit_provenance.json').exists())
+
+    def test_export_recovery_rejects_incomplete_raw_models(self):
+        results=self.fit_stub()
+        folder=Path(results['typed'][0]).parent
+        (folder/'fit_provenance.json').unlink()
+        (folder/'TYPED_FITHRF_GLMDENOISE_RR.npy').unlink()
+        with self.assertRaisesRegex(ValueError,'raw B/D outputs are incomplete'):self.fit_stub(export_only=True)
+
+    def test_conditionwise_exports_retain_run_and_trial_order(self):
+        pd.DataFrame(dict(onset=[4.,0.,8.],duration=[0.,8.,8.],trial_type=['US','CS','CS'])).to_csv(self.events[0],sep='\t',index=False)
+        results=self.fit_stub(split_trial_types=True)
+        folder=Path(results['typed'][0]).parent
+        paths=list((folder/'conditionwise/model-typed').glob('*.nii.gz'))
+        self.assertEqual(len(paths),3)
+        path=next(path for path in paths if 'run-01_' in path.name and 'condition-CS_' in path.name)
+        image=nib.load(path)
+        self.assertEqual(image.shape,(2,2,2,2))
+        self.assertEqual(image.get_fdata()[0,0,0].tolist(),[0.,2.])
+        self.assertEqual(image.header.get_zooms()[-1],1.)
+        metadata=json.loads(Path(str(path).replace('.nii.gz','.json')).read_text())
+        self.assertEqual(metadata['NumberOfVolumes'],7)
+        self.assertEqual(metadata['FourthDimension'],'trial')
+        self.assertEqual([row['BetaIndex'] for row in metadata['Events']],[1,3])
+        self.assertEqual([row['duration'] for row in metadata['Events']],[0.,0.])
+        self.assertEqual([row['RecordedDuration'] for row in metadata['Events']],[8.,8.])
 
     def test_complete_export_and_existing_fit_guard(self):
         results=self.fit_stub()

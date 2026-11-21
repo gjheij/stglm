@@ -85,3 +85,93 @@ def update_vals_with_mean_gm_tsnr(
 
     out["mean_gm_tsnr"] = float(values.mean())
     return out
+
+
+def collect_base_metadata(
+    tags,
+    vals,
+    metadata,
+    Conditions,
+    ConditionFile,
+    ConditionUnits,
+    BasedOn,
+    Model,
+):
+    """Build a flat HALFpipe-like statmap metadata object.
+
+    Upstream metadata and run values are retained, common snake_case aliases are
+    normalized to the capitalization used by HALFpipe, and workflow bookkeeping
+    fields that are absent from the reference sidecar are omitted.
+    """
+    canonical_keys = {
+        "acquisition_orientation": "AcquisitionOrientation",
+        "acquisition_volume_shape": "AcquisitionVolumeShape",
+        "acquisition_voxel_size": "AcquisitionVoxelSize",
+        "confound_regressors": "ConfoundRegressors",
+        "dummy_scans": "DummyScans",
+        "fd_max": "FDMax",
+        "fd_mean": "FDMean",
+        "fd_perc": "FDPerc",
+        "fallback_registration": "FallbackRegistration",
+        "halfpipe_version": "HALFpipeVersion",
+        "mean_gm_tsnr": "MeanGMTSNR",
+        "model": "Model",
+        "number_of_volumes": "NumberOfVolumes",
+        "raw_sources": "RawSources",
+        "repetition_time": "RepetitionTime",
+        "scan_start": "ScanStart",
+        "setting": "Setting",
+        "task_name": "TaskName",
+    }
+
+    out = {}
+    for source in (metadata, vals):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if value is None:
+                continue
+            out[canonical_keys.get(key, key)] = value
+
+    if isinstance(Model, dict) and Model:
+        existing_model = dict(out.get("Model") or {})
+        existing_model.update(Model)
+        out["Model"] = existing_model
+
+    # Prefer an existing RawSources list; otherwise compose it from known inputs.
+    raw_sources = out.get("RawSources", [])
+    if isinstance(raw_sources, str):
+        raw_sources = [raw_sources]
+    elif not isinstance(raw_sources, list):
+        raw_sources = list(raw_sources) if raw_sources else []
+
+    for source in (ConditionFile, BasedOn):
+        if source is None:
+            continue
+        values = source if isinstance(source, (list, tuple)) else [source]
+        for value in values:
+            if value not in raw_sources:
+                raw_sources.append(value)
+    if raw_sources:
+        out["RawSources"] = raw_sources
+
+    if isinstance(tags, dict):
+        task = tags.get("task")
+        if task and "TaskName" not in out:
+            out["TaskName"] = task
+        space = tags.get("space")
+        if space:
+            setting = dict(out.get("Setting") or {})
+            setting.setdefault("Space", space)
+            out["Setting"] = setting
+
+    # These describe parsing/model setup rather than the reference statmap metadata.
+    out.pop("Conditions", None)
+    out.pop("ConditionFile", None)
+    out.pop("ConditionUnits", None)
+    out.pop("Sources", None)
+    out.pop("Tags", None)
+    out.pop("events", None)
+    out.pop("condition", None)
+    out.pop("estimation", None)
+    return out

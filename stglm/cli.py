@@ -144,7 +144,21 @@ def build_inputs(
             run_tr = layout.get_metadata(bold.path).get("RepetitionTime", tr)
             if not np.isclose(float(run_tr), float(tr), rtol=0, atol=1e-5):
                 raise ValueError("GLMsingle requires a common TR across runs")
+        # Read fMRIPrep confounds for motion QC independently of which nuisance
+        # regressors GLMsingle actually fits.
+        qc_confounds = layout.get(subject=subject,task=task,suffix="timeseries",
+                                 desc="confounds",extension="tsv",return_type="object")
+        qc_runs = []
+        for bold in bold_files:
+            fd = _find_bids_match(bold,qc_confounds,"FD confounds for QC",required=False)
+            gm = _find_bids_match(bold,gm_probsegs,"GM probability map for QC",required=False)
+            mask = _find_bids_match(bold,mask_files,"brain mask for QC",required=False)
+            qc_runs.append(dict(bold=bold.path,tr=float(tr),metadata=layout.get_metadata(bold.path),
+                                fd_confounds=fd.path if fd is not None else None,
+                                gm_probseg=gm.path if gm is not None else None,
+                                mask=mask.path if mask is not None else None))
         return {
+            "qc_runs": qc_runs,
             "bold_files": [item.path for item in bold_files],
             "event_files": [item.path for item in matched_events],
             "tr": tr,
@@ -561,6 +575,10 @@ For more custom implementation, this package might not be for you.
         help="Run GLMsingle, instead of 'standard' LSA/LSS. Implements GLMdenoise, HRF optimization, and beta-regularization. Requires multiple runs and repeats!"
     )
 
+    parser.add_argument('--export-only', action='store_true',
+        help='Export existing GLMsingle models without fitting; verify DESIGNINFO and any saved input plan')
+    parser.add_argument('--split-trial-types', action='store_true',
+        help='Also export per-run/condition 4D trial beta images with JSON and TSV metadata')
     parser.add_argument('--drop-invalid', action='store_true',
         help='Exclude out-of-grid events and events with less than 8 s after the rounded onset; save excluded_events.tsv without shifting timing')
     parser.add_argument('--event-duration', action='append', default=[], metavar='PATTERN=SECONDS',
@@ -632,8 +650,8 @@ def main():
     )
 
     run_glmsingle = args.glm_single
-    if not run_glmsingle and (args.event_duration or args.additional_confounds or args.drop_invalid):
-        raise ValueError("--event-duration, --additional-confounds and --drop-invalid require --glm-single")
+    if not run_glmsingle and (args.event_duration or args.additional_confounds or args.drop_invalid or args.export_only or args.split_trial_types):
+        raise ValueError("GLMsingle event/confound/export options require --glm-single")
     if args.deriv_dir is None:
         if run_glmsingle:
             derivatives_base_dir = "glmsingle"
@@ -768,6 +786,9 @@ def main():
         _ = run_glmsingle_from_inputs(
             **runs, event_durations=args.event_duration,
             additional_confounds=args.additional_confounds, drop_invalid=args.drop_invalid,
+            export_only=args.export_only, split_trial_types=args.split_trial_types,
+            fd_threshold=args.fd_threshold, gm_threshold=args.gm_threshold,
+            tsnr_regress_poly=args.tsnr_regress_poly,
         )
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ def validate_event_times(df, img, bold, events, tr, drop_invalid=False):
 
 
 def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration=0,
-                 event_durations=(), additional_confounds=(), drop_invalid=False, return_diagnostics=False):
+                 event_durations=(), additional_confounds=(), drop_invalid=False, return_diagnostics=False, load_data=True):
     if not np.isfinite(tr) or tr <= 0 or not np.isfinite(stim_duration) or stim_duration < 0:
         raise ValueError('TR must be positive and stimulus duration must be nonnegative')
     if not bold_files or len(set(map(str, bold_files))) != len(bold_files):
@@ -202,10 +202,14 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
         designs.append(design)
     # Finish timing/design validation for every run before reading large arrays.
     for bold, _, _ in pairs:
-        values = nib.load(str(bold)).get_fdata(dtype=np.float32)
-        if not np.isfinite(values).all():
-            raise ValueError('BOLD contains non-finite values: ' + str(bold))
-        data.append(values)
+        image = nib.load(str(bold))
+        if load_data:
+            values = image.get_fdata(dtype=np.float32)
+            if not np.isfinite(values).all():
+                raise ValueError('BOLD contains non-finite values: ' + str(bold))
+            data.append(values)
+        else:
+            data.append(image)
     result = (pairs, data, designs, pd.DataFrame(trials), conditions, regressors, inputs)
     if not return_diagnostics:
         return result
@@ -218,25 +222,126 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
     return (*result, diagnostics)
 
 
+def validate_saved_design(folder, designs, tr, duration, conditions, trials, parameters):
+    """Verify legacy raw outputs against the exact designs before export recovery."""
+    path = folder / 'DESIGNINFO.npy'
+    if not path.is_file():
+        raise ValueError('Export recovery requires DESIGNINFO.npy: ' + str(path))
+    saved = np.load(path, allow_pickle=True).item()
+    actual = saved.get('design', [])
+    if (len(actual) != len(designs)
+            or not np.isclose(float(saved['tr']), tr, rtol=0, atol=1e-6)
+            or not np.isclose(float(saved['stimdur']), duration, rtol=0, atol=1e-9)
+            or any(not np.array_equal(old, new) for old,new in zip(actual,designs))):
+        raise ValueError('Saved GLMsingle design/TR/duration differs from requested export settings')
+    expected_order = [conditions.index(value) for value in trials.trial_type]
+    if not np.array_equal(np.asarray(saved['stimorder']).ravel(),expected_order):
+        raise ValueError('Saved GLMsingle trial order differs from the reconstructed trial table')
+    if not np.array_equal(np.asarray(saved['numtrialrun']).ravel(),[int(design.sum()) for design in designs]):
+        raise ValueError('Saved GLMsingle per-run trial counts differ')
+    original = saved.get('params', {})
+    def matrices(value):
+        if value is None or value is False:
+            return []
+        if isinstance(value,(list,tuple)) and len(value)==1 and value[0] is False:
+            return []
+        return list(value)
+    old_extra = matrices(original.get('extra_regressors'))
+    new_extra = matrices(parameters.get('extra_regressors'))
+    if len(old_extra)!=len(new_extra) or any(
+            np.asarray(a).shape!=np.asarray(b).shape or not np.allclose(a,b,rtol=0,atol=1e-12)
+            for a,b in zip(old_extra,new_extra)):
+        raise ValueError('Saved GLMsingle additional regressors differ from current inputs')
+    outputs = original.get('wantfileoutputs', [1,1,1,1])
+    required = []
+    if outputs[1]:
+        required.append('TYPEB_FITHRF.npy')
+    if outputs[3] and original.get('wantfracridge',1):
+        required.append('TYPED_FITHRF_GLMDENOISE_RR.npy')
+    if not required or any(not (folder/name).is_file() for name in required):
+        raise ValueError('Requested GLMsingle raw B/D outputs are incomplete; refusing recovery')
+
+
+def export_conditionwise(betas, reference, folder, model, trials, run_order, tr, run_metadata=None):
+    """Write 4D trial series and HALFpipe-like JSON metadata per run/condition."""
+    image = nib.load(str(reference))
+    target = folder / 'conditionwise' / ('model-' + model)
+    target.mkdir(parents=True, exist_ok=True)
+    outputs = []
+    names = set()
+    for (run_index, condition), group in trials.groupby(['run_index','trial_type'],sort=False):
+        tags = run_order[int(run_index)]['entities']
+        prefix = '_'.join(f'{key}-{tags[key]}' for key in ('sub','ses','task','acq','run','echo','space','desc') if tags.get(key))
+        # Keep original condition spelling, including percent signs and underscores,
+        # but forbid path separators and reject sanitization collisions.
+        safe_condition = re.sub(r'[^A-Za-z0-9_%+.-]', '-',str(condition))
+        name = f'{prefix}_feature-GLMsingle{model.upper()}_condition-{safe_condition}_stat-effect_statmap'
+        if name in names:
+            raise ValueError('Condition-wise output filename collision: ' + name)
+        names.add(name)
+        selected = group.beta_index.to_numpy(int)-1
+        values = np.asarray(betas[...,selected],dtype=np.float32)
+        header = image.header.copy()
+        header.set_data_dtype(np.float32)
+        header.set_data_shape(values.shape)
+        header.set_zooms((*image.header.get_zooms()[:3],1.))
+        header.set_xyzt_units(t='unknown')
+        path = target/(name+'.nii.gz')
+        nib.save(nib.Nifti1Image(values,image.affine,header),path)
+        sidecar = target/(name+'.json')
+        import copy
+        metadata = copy.deepcopy((run_metadata or {}).get(int(run_index),{}))
+        model_info = dict(metadata.get('Model') or {})
+        model_info.update(Estimator='GLMsingle',OutputType=model,Condition=str(condition),JointRuns=True)
+        metadata.update(RepetitionTime=float(tr), NumberOfVolumes=run_order[int(run_index)]['n_volumes'],
+            Model=model_info,FourthDimension='trial',
+            Sources=[run_order[int(run_index)]['bold'],run_order[int(run_index)]['events']],
+            Events=[dict(onset=float(row.onset),duration=float(row.modeled_duration),
+                         RecordedDuration=float(row.duration),ModeledOnset=float(row.modeled_onset),
+                         TrialID=row.trial_id,BetaIndex=int(row.beta_index)) for _,row in group.iterrows()])
+        atomic_json(sidecar,metadata)
+        metadata = target/(name+'_trials.tsv')
+        group = group.copy()
+        group['volume_index'] = np.arange(len(group))
+        group.to_csv(metadata,sep='\t',index=False)
+        outputs.extend([path,sidecar,metadata])
+    return outputs
+
+
 def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=None,
-                  stim_duration=0, event_durations=(), additional_confounds=(), tags=None, params=None, drop_invalid=False):
+                  stim_duration=0, event_durations=(), additional_confounds=(), tags=None, params=None, drop_invalid=False,
+                  export_only=False, split_trial_types=False, qc_runs=None,
+                  fd_threshold=.2, gm_threshold=.5, tsnr_regress_poly=2):
     from glmsingle.glmsingle import GLM_single
     from stglm import utils
     import importlib.metadata
     import fcntl
     pairs, data, designs, trials, conditions, regressors, inputs, diagnostics = prepare_runs(
         bold_files, event_files, tr, include_trials, stim_duration, event_durations, additional_confounds,
-        drop_invalid=drop_invalid, return_diagnostics=True)
+        drop_invalid=drop_invalid, return_diagnostics=True, load_data=False)
     tags = pairs[0][2]
     stream = '_'.join(f'{key}-{tags[key]}' for key in ('task','space','desc','acq','echo') if tags.get(key))
     # Sessions may be fitted jointly; run_index disambiguates repeated run labels.
     final = Path(output_dir) / ('sub-' + tags['sub']) / stream
     final.mkdir(parents=True, exist_ok=True)
-    with (final / '.fit.lock').open('a') as lock:
+    # GLMsingle recreates outputdir; locks and the input plan must live outside it.
+    lock_path = final.parent / ('.' + final.name + '.fit.lock')
+    plan_path = final.parent / ('.' + final.name + '.fit_input.json')
+    with lock_path.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         marker = final / 'fit_provenance.json'
-        if marker.exists():
-            raise ValueError('Completed fit already exists; use a separate output directory: ' + str(final))
+        completed_export = marker.is_file()
+        if completed_export:
+            if not export_only:
+                raise ValueError('Completed fit already exists; use --export-only to add exports or a separate output directory to refit: ' + str(final))
+            previous = json.loads(marker.read_text())
+            if previous.get('inputs') != inputs:
+                raise ValueError('Inputs differ from the completed export; refusing re-export')
+            for saved in previous['outputs']:
+                if identity(saved['path']) != saved:
+                    raise ValueError('Existing exported output changed: ' + saved['path'])
+        # Refresh existing condition-wise sidecars when run QC is added later.
+        split_trial_types = split_trial_types or (final/'conditionwise').is_dir()
         import logging
         if not np.allclose(trials.duration.to_numpy(float), float(stim_duration)):
             logging.getLogger(__name__).warning(
@@ -248,8 +353,8 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
             parameters['extra_regressors'] = regressors
         # Prevent files from a failed older fit being mistaken for current output.
         existing = list(final.glob('TYPE*.npy')) + list(final.glob('model-*_beta-*.nii.gz'))
-        if existing:
-            raise ValueError('Partial fit outputs already exist; use a fresh output directory: ' + str(final))
+        if existing and not export_only:
+            raise ValueError('Existing model outputs found; use --export-only to recover exports, or a fresh output directory to refit: ' + str(final))
         session_values = [tags.get('ses','') for _, _, tags in pairs]
         if len(set(session_values)) > 1 and 'sessionindicator' not in parameters:
             parameters['sessionindicator'] = np.asarray([[sorted(set(session_values)).index(v)+1 for v in session_values]])
@@ -265,36 +370,114 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 if matrix.ndim != 2 or matrix.shape[0] != run_data.shape[-1] or not np.isfinite(matrix).all():
                     raise ValueError('extra_regressors must be finite time-by-regressor matrices')
                 extra_info.append(dict(shape=list(matrix.shape), sha256=hashlib.sha256(matrix.tobytes()).hexdigest()))
+        run_order = [dict(bold=str(b), events=str(e), entities=t, n_volumes=image.shape[-1])
+                     for (b,e,t), image in zip(pairs,data)]
+        spatial_shape = tuple(data[0].shape[:3])
+        plan = dict(inputs=inputs, conditions=conditions, run_order=run_order,
+                    tr=float(tr), stim_duration=float(stim_duration), drop_invalid=bool(drop_invalid),
+                    minimum_end_buffer_seconds=8. if drop_invalid else None,
+                    parameters={key:value for key,value in requested_parameters.items() if key != 'extra_regressors'},
+                    extra_regressors=extra_info,
+                    trials_sha256=hashlib.sha256(trials.to_csv(index=False).encode()).hexdigest())
+        # Convert numpy settings identically to atomic_json before comparing a saved plan.
+        plan = json.loads(json.dumps(plan, default=lambda obj: obj.tolist() if isinstance(obj,np.ndarray) else obj.item() if isinstance(obj,np.generic) else str(obj)))
+        recovery_validation = 'original_input_plan'
+        if export_only:
+            if plan_path.is_file():
+                if json.loads(plan_path.read_text()) != plan:
+                    raise ValueError('Inputs/settings differ from the saved fit plan; refusing export recovery')
+            else:
+                recovery_validation = 'saved_design_only_legacy_input_history_unavailable'
+                logging.getLogger(__name__).warning(
+                    'Legacy export recovery: checking DESIGNINFO.npy and beta dimensions; original input identities were not saved before this fit')
+            validate_saved_design(final, designs, tr, stim_duration, conditions, trials, requested_parameters)
+            if completed_export:
+                # Do not leave a stale success marker if metadata enrichment fails
+                # halfway through. Raw fits and the previous provenance survive.
+                atomic_json(final.parent/('.'+final.name+'.previous_export.json'),previous)
+                marker.unlink()
+        else:
+            atomic_json(plan_path, plan)
+            if not diagnostics['late_events'].empty:
+                logging.getLogger(__name__).warning(
+                    '%d retained events have less than 16 s after onset; QC will be saved after fitting',len(diagnostics['late_events']))
+            # Load large arrays only after output guards and save the input plan
+            # outside the directory that GLMsingle deletes at initialization.
+            fit_data = []
+            for bold,_,_ in pairs:
+                values = nib.load(str(bold)).get_fdata(dtype=np.float32)
+                if not np.isfinite(values).all():
+                    raise ValueError('BOLD contains non-finite values: ' + str(bold))
+                fit_data.append(values)
+            del values
+            try:
+                GLM_single(params=copy.deepcopy(parameters)).fit(designs, fit_data, stim_duration, tr,
+                    outputdir=str(final), figuredir=str(final/'figures'))
+            finally:
+                # Release BOLD data before loading large model dictionaries for export.
+                del fit_data
+        # GLMsingle has finished deleting/recreating its outputdir. Diagnostics
+        # belong here, not before fit(). Recovery never invokes the fitter.
+        final.mkdir(parents=True, exist_ok=True)
         diagnostic_paths = []
         for name, frame in diagnostics.items():
             path = final / (name + '.tsv')
             frame.to_csv(path, sep='\t', index=False)
             diagnostic_paths.append(path)
-        if not diagnostics['late_events'].empty:
-            logging.getLogger(__name__).warning(
-                '%d retained events have less than 16 s of acquisition after onset; see %s',
-                len(diagnostics['late_events']), final/'late_events.tsv')
-        GLM_single(params=copy.deepcopy(parameters)).fit(designs, data, stim_duration, tr,
-            outputdir=str(final), figuredir=str(final/'figures'))
+        run_metadata = {}
+        qc_outputs = []
+        qc_inputs = []
+        if qc_runs is not None:
+            from stglm.glmsingle_qc import build_run_metadata
+            run_metadata,qc_outputs,qc_inputs=build_run_metadata(
+                pairs,qc_runs,final,additional_confounds=additional_confounds,
+                fd_threshold=fd_threshold,gm_threshold=gm_threshold,
+                regress_poly=tsnr_regress_poly,extra_regressors=extra_info)
+        design_info=final/'DESIGNINFO.npy'
+        actual_parameters=np.load(design_info,allow_pickle=True).item()['params'] if design_info.is_file() else requested_parameters
+        actual_parameters=dict(actual_parameters)
+        actual_parameters['ExtraRegressorsByRun']=extra_info
         models = {'typeb':'TYPEB_FITHRF.npy', 'typed':'TYPED_FITHRF_GLMDENOISE_RR.npy'}
         results = {}
-        outputs = [identity(path) for path in diagnostic_paths]
+        outputs = [identity(path) for path in diagnostic_paths+qc_outputs]
         for model, filename in models.items():
             raw = final / filename
             if not raw.is_file():
                 continue
             fitted = np.load(raw, allow_pickle=True).item()
-            if fitted['betasmd'].shape != (*data[0].shape[:3], len(trials)):
+            if fitted['betasmd'].shape != (*spatial_shape, len(trials)):
                 raise ValueError('GLMsingle beta dimensions differ from the modeled trial table')
-            utils.save_glmsingle_outputs(fitted, pairs[0][0], str(final), prefix='model-'+model)
+            if not completed_export:
+                utils.save_glmsingle_outputs(fitted, pairs[0][0], str(final), prefix='model-'+model)
+            model_run_metadata = run_metadata
+            if run_metadata:
+                from stglm.glmsingle_qc import model_metadata
+                model_run_metadata={index:model_metadata(base,model,actual_parameters,fitted,index)
+                                    for index,base in run_metadata.items()}
+            grouped_paths = export_conditionwise(fitted['betasmd'], pairs[0][0], final, model, trials, run_order, tr,
+                                                run_metadata=model_run_metadata) if split_trial_types else []
             files = sorted(final.glob(f'model-{model}_beta-*.nii.gz'))
             if len(files) != len(trials):
                 raise ValueError('Exported beta count differs from modeled trials')
+            # Individual betas get the same run QC/metadata as the optional 4D files.
+            sidecars=[]
+            for (_,row),path in zip(trials.iterrows(),files):
+                base=copy.deepcopy(model_run_metadata.get(int(row.run_index),{}))
+                info=dict(base.get('Model') or {})
+                info.update(Estimator='GLMsingle',OutputType=model,Condition=row.trial_type,JointRuns=True)
+                base.update(Model=info,RepetitionTime=float(tr),NumberOfVolumes=run_order[int(row.run_index)]['n_volumes'],
+                    Events=[dict(onset=float(row.onset),duration=float(row.modeled_duration),
+                                 RecordedDuration=float(row.duration),ModeledOnset=float(row.modeled_onset),
+                                 TrialID=row.trial_id,BetaIndex=int(row.beta_index))])
+                sidecar=Path(str(path).removesuffix('.nii.gz')+'.json')
+                atomic_json(sidecar,base);sidecars.append(sidecar)
             frame = trials.copy();frame['model'] = model;frame['beta_file'] = [p.name for p in files]
             manifest = final / f'model-{model}_trial_manifest.tsv'
-            frame.to_csv(manifest, sep='\t', index=False)
-            outputs.extend(identity(p) for p in files+[manifest, raw])
+            if not completed_export:
+                frame.to_csv(manifest, sep='\t', index=False)
+            outputs.extend(identity(p) for p in files+[manifest, raw]+grouped_paths+sidecars)
             results[model] = list(map(str, files))
+            del fitted
         if not results:
             raise ValueError('GLMsingle produced no supported B/D beta files; enable file outputs')
         np.savetxt(final/'trial_list.txt', trials.trial_type.to_numpy(), fmt='%s')
@@ -304,7 +487,7 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 versions[package] = 'unknown'
-        for saved in inputs:
+        for saved in inputs+qc_inputs:
             if identity(saved['path']) != saved:
                 raise ValueError('Input changed during GLMsingle fitting: ' + saved['path'])
         atomic_json(marker, dict(status='complete', fit_scope='joint_runs', inputs=inputs, outputs=outputs,
@@ -314,6 +497,10 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
             late_event_warning_window_seconds=16., late_event_count=len(diagnostics['late_events']),
             parameters={key: value for key, value in requested_parameters.items() if key != 'extra_regressors'},
             extra_regressors=extra_info,
-            run_order=[dict(bold=str(b), events=str(e), entities=t, n_volumes=values.shape[-1])
-                       for (b,e,t), values in zip(pairs,data)], versions=versions))
+            run_order=run_order, versions=versions,
+            export_only=bool(export_only), recovery_validation=recovery_validation,
+            split_trial_types=bool(split_trial_types), qc_inputs=qc_inputs,
+            qc_settings=dict(fd_threshold=float(fd_threshold),gm_threshold=float(gm_threshold),
+                             tsnr_regress_poly=int(tsnr_regress_poly)),
+            qc_status={str(index):meta['QCStatus'] for index,meta in run_metadata.items()}, input_plan=str(plan_path) if plan_path.is_file() else None))
         return results
