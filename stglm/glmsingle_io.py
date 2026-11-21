@@ -102,16 +102,29 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
         if shape is not None and (img.shape[:3] != shape or not np.allclose(img.affine, affine, rtol=0, atol=1e-5)):
             raise ValueError('BOLD grids differ across runs')
         shape, affine = img.shape[:3], img.affine
-        values = img.get_fdata(dtype=np.float32)
-        if not np.isfinite(values).all():
-            raise ValueError('BOLD contains non-finite values: ' + str(bold))
         onsets = pd.to_numeric(df.onset, errors='raise').to_numpy(float)
         durations = pd.to_numeric(df.duration, errors='raise').to_numpy(float)
         if not np.isfinite(onsets).all() or not np.isfinite(durations).all() or (durations < 0).any():
             raise ValueError('Invalid event timing: ' + str(events))
         volumes = np.rint(onsets / tr).astype(int)
-        if (onsets < 0).any() or (volumes < 0).any() or (volumes >= img.shape[-1]).any():
-            raise ValueError('Selected event outside acquired run: ' + str(events))
+        invalid = (onsets < 0) | (volumes < 0) | (volumes >= img.shape[-1])
+        if invalid.any():
+            bad = df.loc[invalid, ['source_row', 'trial_type', 'onset', 'duration']].copy()
+            bad['tsv_line'] = bad.pop('source_row').astype(int) + 2
+            bad['design_volume'] = volumes[invalid]
+            acquisition_end = img.shape[-1] * tr
+            bad['reason'] = np.where(onsets[invalid] < 0, 'negative onset',
+                np.where(onsets[invalid] >= acquisition_end, 'onset beyond acquisition',
+                         'rounding beyond final design row'))
+            raise ValueError(
+                'Selected event outside acquired run/design grid.\n'
+                f'BOLD: {bold}\nEvents: {events}\n'
+                f'Volumes: {img.shape[-1]}; TR: {tr:g} s; acquisition span: [0, {acquisition_end:g}) s; '
+                f'last sampled time: {(img.shape[-1]-1)*tr:g} s; valid design indices: 0..{img.shape[-1]-1}.\n'
+                f'Invalid selected events: {len(bad)} of {len(df)} (first 10 shown):\n'
+                + bad.head(10).to_string(index=False)
+                + '\nCheck the BOLD/events match, TR, time origin and any removed volumes. '
+                  'No events were dropped or shifted and fitting has not started.')
         if len(np.unique(volumes)) != len(volumes):
             raise ValueError('Selected events collide after onset-to-TR rounding: ' + str(events))
         df = df.assign(design_volume=volumes).sort_values('design_volume', kind='stable')
@@ -141,7 +154,13 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
                 raise ValueError('Additional confounds contain constant or linearly dependent columns')
             regressors.append(array)
         inputs.extend([identity(bold), identity(events)])
-        data.append(values); designs.append(design)
+        designs.append(design)
+    # Finish timing/design validation for every run before reading large arrays.
+    for bold, _, _ in pairs:
+        values = nib.load(str(bold)).get_fdata(dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError('BOLD contains non-finite values: ' + str(bold))
+        data.append(values)
     return pairs, data, designs, pd.DataFrame(trials), conditions, regressors, inputs
 
 
