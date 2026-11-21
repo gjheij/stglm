@@ -142,6 +142,25 @@ class Runs(unittest.TestCase):
         frame.duration=[-1.,0.];frame.to_csv(self.events[0],sep='\t',index=False)
         with self.assertRaisesRegex(ValueError,'Invalid event timing'):self.prepare(drop_invalid=True)
 
+    def test_drop_invalid_matches_glmsingle_eight_second_rule(self):
+        # Seven volumes at TR=2: onset row 2 has exactly 8 s, row 3 has 6 s.
+        frame=pd.DataFrame(dict(onset=[4.,5.1,12.],duration=[0.]*3,
+                                trial_type=['boundary','rounded_late','last_volume'],source_row=[0,1,2]))
+        image=nib.load(self.bold[0])
+        retained,excluded=io.validate_event_times(frame,image,self.bold[0],self.events[0],2.,True)
+        self.assertEqual(retained.trial_type.tolist(),['boundary'])
+        self.assertEqual(excluded.trial_type.tolist(),['rounded_late','last_volume'])
+        self.assertEqual(excluded.end_buffer_seconds.tolist(),[6.,0.])
+        self.assertEqual(set(excluded.reason),{'less than 8 s after modeled onset'})
+        for volume in retained.design_volume:
+            self.assertGreaterEqual((image.shape[-1]-volume-1)*2.,8.)
+
+    def test_eight_second_exclusion_requires_explicit_flag(self):
+        frame=pd.DataFrame(dict(onset=[5.1],duration=[0.],trial_type=['late'],source_row=[0]))
+        retained,excluded=io.validate_event_times(frame,nib.load(self.bold[0]),self.bold[0],self.events[0],2.,False)
+        self.assertEqual(len(retained),1)
+        self.assertTrue(excluded.empty)
+
     def test_drop_invalid_refuses_to_discard_an_entire_run(self):
         frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[100.,200.]
         frame.to_csv(self.events[0],sep='\t',index=False)
@@ -159,6 +178,7 @@ class Runs(unittest.TestCase):
         self.assertEqual(len(results['typed']),2)
         self.assertEqual(excluded.trial_type.tolist(),['US'])
         self.assertTrue(provenance['drop_invalid'])
+        self.assertEqual(provenance['minimum_end_buffer_seconds'],8.)
         self.assertEqual(provenance['excluded_event_count'],1)
         self.assertTrue((folder/'late_events.tsv').is_file())
         self.assertTrue((folder/'run_summary.tsv').is_file())

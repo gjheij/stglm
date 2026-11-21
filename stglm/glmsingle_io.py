@@ -34,22 +34,29 @@ def atomic_json(path, value):
 
 
 def validate_event_times(df, img, bold, events, tr, drop_invalid=False):
-    """Reject malformed timings; optionally exclude only out-of-grid onsets."""
+    """Validate timing and optionally enforce GLMsingle's eight-second end buffer."""
     onsets = pd.to_numeric(df.onset, errors='raise').to_numpy(float)
     durations = pd.to_numeric(df.duration, errors='raise').to_numpy(float)
     if not np.isfinite(onsets).all() or not np.isfinite(durations).all() or (durations < 0).any():
         raise ValueError('Invalid event timing: ' + str(events))
     volumes = np.rint(onsets / tr).astype(int)
-    invalid = (onsets < 0) | (volumes < 0) | (volumes >= img.shape[-1])
+    outside_grid = (onsets < 0) | (volumes < 0) | (volumes >= img.shape[-1])
+    # Match GLMsingle exactly: sampled volumes AFTER the rounded onset row.
+    # Its warning uses (number_of_volumes - onset_row - 1) * TR, not the
+    # continuous acquisition endpoint minus the original event onset.
+    end_buffer = (img.shape[-1] - volumes - 1) * tr
+    invalid = outside_grid | ((end_buffer < 8.) if drop_invalid else False)
     excluded = pd.DataFrame()
     if invalid.any():
         bad = df.loc[invalid, ['source_row', 'trial_type', 'onset', 'duration']].copy()
         bad['tsv_line'] = bad.pop('source_row').astype(int) + 2
         bad['design_volume'] = volumes[invalid]
+        bad['end_buffer_seconds'] = end_buffer[invalid]
         acquisition_end = img.shape[-1] * tr
         bad['reason'] = np.where(onsets[invalid] < 0, 'negative onset',
             np.where(onsets[invalid] >= acquisition_end, 'onset beyond acquisition',
-                     'rounding beyond final design row'))
+                np.where((volumes[invalid] < 0) | (volumes[invalid] >= img.shape[-1]),
+                         'rounding beyond final design row', 'less than 8 s after modeled onset')))
         if not drop_invalid:
             raise ValueError(
                 'Selected event outside acquired run/design grid.\n'
@@ -63,6 +70,7 @@ def validate_event_times(df, img, bold, events, tr, drop_invalid=False):
         excluded = df.loc[invalid].copy()
         excluded['tsv_line'] = excluded['source_row'].astype(int) + 2
         excluded['design_volume'] = volumes[invalid]
+        excluded['end_buffer_seconds'] = end_buffer[invalid]
         excluded['reason'] = bad['reason'].to_numpy()
         df = df.loc[~invalid].copy()
         volumes = volumes[~invalid]
@@ -174,6 +182,7 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
                 acquisition=tags.get('acq',''), echo=tags.get('echo',''),
                 onset=float(row.onset), duration=float(row.duration), modeled_duration=float(stim_duration),
                 design_volume=int(row.design_volume), modeled_onset=float(row.design_volume)*tr,
+                end_buffer_seconds=float((img.shape[-1]-int(row.design_volume)-1)*tr),
                 source_row=int(row.source_row), events_file=str(Path(events).resolve()), bold_file=str(Path(bold).resolve())))
         columns = []
         for template in additional_confounds:
@@ -200,7 +209,7 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
     result = (pairs, data, designs, pd.DataFrame(trials), conditions, regressors, inputs)
     if not return_diagnostics:
         return result
-    empty_columns = ['source_row','tsv_line','trial_type','onset','duration','design_volume','reason',
+    empty_columns = ['source_row','tsv_line','trial_type','onset','duration','design_volume','end_buffer_seconds','reason',
                      'subject','session','run','bold_file','events_file']
     diagnostics = dict(
         excluded_events=pd.concat(excluded_frames, ignore_index=True) if excluded_frames else pd.DataFrame(columns=empty_columns),
@@ -300,7 +309,8 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 raise ValueError('Input changed during GLMsingle fitting: ' + saved['path'])
         atomic_json(marker, dict(status='complete', fit_scope='joint_runs', inputs=inputs, outputs=outputs,
             conditions=conditions, tr=float(tr), stim_duration=float(stim_duration),
-            drop_invalid=bool(drop_invalid), excluded_event_count=len(diagnostics['excluded_events']),
+            drop_invalid=bool(drop_invalid), minimum_end_buffer_seconds=8. if drop_invalid else None,
+            excluded_event_count=len(diagnostics['excluded_events']),
             late_event_warning_window_seconds=16., late_event_count=len(diagnostics['late_events']),
             parameters={key: value for key, value in requested_parameters.items() if key != 'extra_regressors'},
             extra_regressors=extra_info,

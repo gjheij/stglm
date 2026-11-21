@@ -562,7 +562,7 @@ For more custom implementation, this package might not be for you.
     )
 
     parser.add_argument('--drop-invalid', action='store_true',
-        help='Explicitly exclude out-of-grid GLMsingle events and save excluded_events.tsv; timing is not shifted')
+        help='Exclude out-of-grid events and events with less than 8 s after the rounded onset; save excluded_events.tsv without shifting timing')
     parser.add_argument('--event-duration', action='append', default=[], metavar='PATTERN=SECONDS',
         help='Validate a condition duration rule for GLMsingle; all modeled durations must equal --stim-duration')
     parser.add_argument('--additional-confounds', action='append', default=[], metavar='TSV_TEMPLATE',
