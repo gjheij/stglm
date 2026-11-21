@@ -139,9 +139,14 @@ def build_inputs(
         raise ValueError(f"RepetitionTime is unavailable for {bold_files[0].path}")
 
     if glm_single:
+        matched_events = [_find_bids_match(bold, events, "events") for bold in bold_files]
+        for bold in bold_files:
+            run_tr = layout.get_metadata(bold.path).get("RepetitionTime", tr)
+            if not np.isclose(float(run_tr), float(tr), rtol=0, atol=1e-5):
+                raise ValueError("GLMsingle requires a common TR across runs")
         return {
             "bold_files": [item.path for item in bold_files],
-            "event_files": [item.path for item in events],
+            "event_files": [item.path for item in matched_events],
             "tr": tr,
             "params": glm_kws,
             "tags": dict(bold_files[0].entities),
@@ -378,100 +383,9 @@ def run_glmsingle_from_inputs(
     stim_duration=0,
     **kwargs
 ):
-    from glmsingle.glmsingle import GLM_single
-
-    logger.info(f"Loading BOLD files")
-    funcs = [
-        nb.load(i).get_fdata(dtype=float) for i in bold_files
-    ]
-
-    # derive chuncklen depending on free memory
-
-    # load the designs
-    logger.info(f"Loading event-files")
-    dms = []
-    event_dfs = []
-    for ev_file in event_files:
-        df = pd.read_csv(ev_file, sep="\t")
-        dm = conditions.events_to_glmsingle_dm(
-            df,
-            funcs[0].shape[-1],
-            tr=tr,
-            include_trials=include_trials
-        )
-        dms.append(dm)
-        event_dfs.append(df)
-
-    tags = kwargs.pop("tags", None)
-    base_path = None
-    if tags is not None:
-        base_path = f"sub-{tags['subject']}"
-        ses_id = f"ses-{tags['session']}" if "session" in tags else None
-
-        if ses_id is not None:
-            base_path = opj(base_path, ses_id)
-
-    # store image of design matrices
-    final_output = opj(
-        output_dir,
-        base_path
-    )
-
-    logger.info(f"Final output directory: {final_output}")
-    if not os.path.exists(opj(final_output, "figures")):
-        os.makedirs(opj(final_output, "figures"), exist_ok=True)
-
-    # save trial list:
-    trial_list = []
-    for df in event_dfs:
-        df = df[df['trial_type'].isin(include_trials)].copy().sort_values("onset")
-        trial_list += df["trial_type"].values.tolist()
-    
-    logger.info(f"Saving trial list with {len(trial_list)} trial IDs")
-    np.savetxt(
-        opj(final_output,'trial_list.txt'),
-        trial_list,
-        fmt="%s"
-    )
-
-    # save design matrices
-    _ = utils.plot_design_matrices(
-        dms,
-        output_dir=opj(final_output, "figures")
-    )
-
-    # run fitter
-    logger.info(f"Start fitting..")
-    gs = GLM_single(**kwargs)
-    gs.fit(
-        dms,
-        funcs,
-        stim_duration,
-        tr,
-        outputdir=final_output,
-        figuredir=opj(final_output, "figures")
-    )
-
-    # save output as nifti-files
-    logger.info(f"Saving outputs to '{final_output}'")
-    models = {
-        "typeb": opj(final_output, "TYPEB_FITHRF.npy"),
-        "typed": opj(final_output, "TYPED_FITHRF_GLMDENOISE_RR.npy"),
-    }
-
-    results = {}
-    for key, val in models.items():
-        if os.path.exists(val):
-            utils.save_glmsingle_outputs(
-                np.load(val, allow_pickle=True).item(),
-                bold_files[0],
-                final_output,
-                prefix=f"model-{key}"
-            )
-
-            results[key] = get_file_from_substring(f"model-{key}_beta-", final_output)
-
-    return results
+    from stglm.glmsingle_io import fit_glmsingle
+    return fit_glmsingle(bold_files, event_files, tr, include_trials=include_trials,
+                         output_dir=output_dir, stim_duration=stim_duration, **kwargs)
 
 
 def valid_file_path(path):
@@ -647,6 +561,10 @@ For more custom implementation, this package might not be for you.
         help="Run GLMsingle, instead of 'standard' LSA/LSS. Implements GLMdenoise, HRF optimization, and beta-regularization. Requires multiple runs and repeats!"
     )
 
+    parser.add_argument('--event-duration', action='append', default=[], metavar='PATTERN=SECONDS',
+        help='Validate a condition duration rule for GLMsingle; all modeled durations must equal --stim-duration')
+    parser.add_argument('--additional-confounds', action='append', default=[], metavar='TSV_TEMPLATE',
+        help='Additional GLMsingle regressors; repeat for files, with {subject}, {session}, {task}, {run} placeholders')
     parser.add_argument(
         '--stim-duration',
         type=float,
@@ -712,6 +630,8 @@ def main():
     )
 
     run_glmsingle = args.glm_single
+    if not run_glmsingle and (args.event_duration or args.additional_confounds):
+        raise ValueError("--event-duration and --additional-confounds require --glm-single")
     if args.deriv_dir is None:
         if run_glmsingle:
             derivatives_base_dir = "glmsingle"
@@ -844,7 +764,8 @@ def main():
         # should contain dictionary with 'bold_files' and 'events', 'tr', 'params', 
         # 'stim_duration'
         _ = run_glmsingle_from_inputs(
-            **runs
+            **runs, event_durations=args.event_duration,
+            additional_confounds=args.additional_confounds,
         )
 
 if __name__ == "__main__":
@@ -853,4 +774,5 @@ if __name__ == "__main__":
         logger.info("stGLM finished without errors")
     except Exception as e:
         logger.error(f"stGLM failed with errors {e}")
+        raise
 

@@ -352,7 +352,7 @@ def plot_design_matrices(dms, output_dir=None, **kwargs):
     
 def save_glmsingle_outputs(results, bold_file, outputdir, prefix="model"):
     """
-    Save GLMsingle outputs using the mean of the first BOLD file as the template.
+    Save GLMsingle outputs using the first BOLD file's spatial geometry.
     
     Parameters:
         results: GLMsingle output dictionary (e.g., results_glmsingle.output)
@@ -361,16 +361,13 @@ def save_glmsingle_outputs(results, bold_file, outputdir, prefix="model"):
     """
     os.makedirs(outputdir, exist_ok=True)
 
-    # Load first BOLD and compute mean over time
+    # Read the first BOLD header for spatial geometry.
     logger.info(f"Loading reference file: {bold_file}")
     img = nb.load(bold_file)
-    data = img.get_fdata()
-    mean_img = np.mean(data, axis=3)
-    mean_nifti = nb.Nifti1Image(mean_img, affine=img.affine, header=img.header)
-
-    affine = mean_nifti.affine
-    header = mean_nifti.header
-    shape = mean_img.shape
+    # Beta export needs geometry only; do not reload an entire 4D BOLD run.
+    affine = img.affine
+    header = img.header.copy()
+    shape = img.shape[:3]
 
     # Save final beta maps
     

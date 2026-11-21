@@ -156,7 +156,8 @@ def events_to_glmsingle_dm(
     n_vols: int,
     tr: float = 1.0,
     include_trials: list[str] | None = None,
-    event_col: str="trial_type"
+    event_col: str="trial_type",
+    condition_names: list[str] | None = None,
     ) -> pd.DataFrame:
     """
     Convert a BIDS events.tsv dataframe into a GLMsingle-style design matrix.
@@ -183,13 +184,17 @@ def events_to_glmsingle_dm(
         type began at that TR, 0 otherwise.
     """
 
+    if not np.isfinite(tr) or tr <= 0 or n_vols < 1:
+        raise ValueError("TR and number of volumes must be positive")
     if include_trials is not None:
         events_df = events_df[events_df[event_col].isin(include_trials)].copy()
 
     logger.info(f"design shape: {events_df.shape}")
 
     # 1. Identify unique conditions (sorted for reproducibility)
-    conds = sorted(events_df[event_col].unique())
+    conds = list(condition_names) if condition_names is not None else sorted(events_df[event_col].unique())
+    if len(set(conds)) != len(conds) or not set(events_df[event_col]).issubset(conds):
+        raise ValueError("Condition columns are duplicated or do not cover the selected events")
     n_conds = len(conds)
 
     # 2. Initialize empty design matrix
@@ -199,6 +204,7 @@ def events_to_glmsingle_dm(
     cond_to_idx = {cond: i for i, cond in enumerate(conds)}
 
     # 4. Fill in sticks
+    occupied = set()
     for _, row in events_df.iterrows():
         onset_sec = row['onset']
         cond      = row[event_col]
@@ -206,7 +212,11 @@ def events_to_glmsingle_dm(
         # convert onset (s) → volume index
         vol_idx = int(round(onset_sec / tr))
 
-        if 0 <= vol_idx < n_vols:
-            dm[vol_idx, cond_to_idx[cond]] = 1
+        if not np.isfinite(onset_sec) or onset_sec < 0 or not 0 <= vol_idx < n_vols:
+            raise ValueError("Event onset lies outside the acquired run")
+        if vol_idx in occupied:
+            raise ValueError("Events collide after onset-to-TR rounding")
+        occupied.add(vol_idx)
+        dm[vol_idx, cond_to_idx[cond]] = 1
 
     return dm
