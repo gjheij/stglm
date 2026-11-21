@@ -561,6 +561,8 @@ For more custom implementation, this package might not be for you.
         help="Run GLMsingle, instead of 'standard' LSA/LSS. Implements GLMdenoise, HRF optimization, and beta-regularization. Requires multiple runs and repeats!"
     )
 
+    parser.add_argument('--drop-invalid', action='store_true',
+        help='Explicitly exclude out-of-grid GLMsingle events and save excluded_events.tsv; timing is not shifted')
     parser.add_argument('--event-duration', action='append', default=[], metavar='PATTERN=SECONDS',
         help='Validate a condition duration rule for GLMsingle; all modeled durations must equal --stim-duration')
     parser.add_argument('--additional-confounds', action='append', default=[], metavar='TSV_TEMPLATE',
@@ -630,8 +632,8 @@ def main():
     )
 
     run_glmsingle = args.glm_single
-    if not run_glmsingle and (args.event_duration or args.additional_confounds):
-        raise ValueError("--event-duration and --additional-confounds require --glm-single")
+    if not run_glmsingle and (args.event_duration or args.additional_confounds or args.drop_invalid):
+        raise ValueError("--event-duration, --additional-confounds and --drop-invalid require --glm-single")
     if args.deriv_dir is None:
         if run_glmsingle:
             derivatives_base_dir = "glmsingle"
@@ -765,7 +767,7 @@ def main():
         # 'stim_duration'
         _ = run_glmsingle_from_inputs(
             **runs, event_durations=args.event_duration,
-            additional_confounds=args.additional_confounds,
+            additional_confounds=args.additional_confounds, drop_invalid=args.drop_invalid,
         )
 
 if __name__ == "__main__":

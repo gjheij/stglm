@@ -58,6 +58,20 @@ class Runs(unittest.TestCase):
         frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[-1.,0.];frame.to_csv(self.events[0],sep='\t',index=False)
         with self.assertRaisesRegex(ValueError,'outside'):self.prepare()
 
+    def test_error_distinguishes_acquisition_boundary_from_rounding(self):
+        frame=pd.read_csv(self.events[0],sep='\t')
+        frame.onset=[13.2,14.0]  # 7 volumes * 2 s: both round to row 7.
+        frame.to_csv(self.events[0],sep='\t',index=False)
+        with self.assertRaises(ValueError) as caught:self.prepare()
+        message=str(caught.exception)
+        self.assertIn('rounding beyond final design row',message)
+        self.assertIn('onset beyond acquisition',message)
+        self.assertIn('Volumes: 7; TR: 2 s',message)
+        self.assertIn('tsv_line',message)
+        self.assertIn('No events were dropped or shifted',message)
+        self.assertIn(self.bold[0],message)
+        self.assertIn(self.events[0],message)
+
     def test_ambiguous_event_matches_are_rejected(self):
         self.events.append(self.events[0])
         with self.assertRaisesRegex(ValueError,'exactly one'):self.prepare()
@@ -85,7 +99,7 @@ class Runs(unittest.TestCase):
         nib.save(nib.Nifti1Image(image.get_fdata(),affine),self.bold[1])
         with self.assertRaisesRegex(ValueError,'grids differ'):self.prepare()
 
-    def fit_stub(self):
+    def fit_stub(self, **kwargs):
         class Engine:
             def __init__(inner,params):
                 self.engine_params=params
@@ -102,7 +116,63 @@ class Runs(unittest.TestCase):
         parent=types.ModuleType('glmsingle');parent.glmsingle=engine_module
         package=types.ModuleType('stglm');package.utils=types.SimpleNamespace(save_glmsingle_outputs=save)
         with patch.dict(sys.modules,{'glmsingle':parent,'glmsingle.glmsingle':engine_module,'stglm':package}):
-            return io.fit_glmsingle(self.bold,self.events,2.,output_dir=self.root/'output',params={'wantfileoutputs':[1,1,1,1]})
+            return io.fit_glmsingle(self.bold,self.events,2.,output_dir=self.root/'output',params={'wantfileoutputs':[1,1,1,1]}, **kwargs)
+
+    def test_drop_invalid_excludes_only_bad_rows_and_rebuilds_conditions(self):
+        frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[100.,0.]
+        frame.to_csv(self.events[0],sep='\t',index=False)
+        result=self.prepare(drop_invalid=True,return_diagnostics=True)
+        _,_,designs,trials,conditions,_,_,diagnostics=result
+        self.assertEqual(conditions,['CS'])
+        self.assertEqual(trials.trial_type.tolist(),['CS','CS'])
+        self.assertEqual(trials.beta_index.tolist(),[1,2])
+        self.assertEqual(trials.onset.tolist(),[0.,4.])
+        self.assertEqual([int(design.sum()) for design in designs],[1,1])
+        excluded=diagnostics['excluded_events']
+        self.assertEqual(excluded.trial_type.tolist(),['US'])
+        self.assertEqual(excluded.source_row.tolist(),[0])
+        self.assertEqual(excluded.tsv_line.tolist(),[2])
+        self.assertEqual(excluded.reason.tolist(),['onset beyond acquisition'])
+        self.assertEqual(diagnostics['run_summary'].excluded_events.tolist(),[1,0])
+
+    def test_drop_invalid_never_drops_malformed_events_or_collisions(self):
+        frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[.1,.2]
+        frame.to_csv(self.events[0],sep='\t',index=False)
+        with self.assertRaisesRegex(ValueError,'collide'):self.prepare(drop_invalid=True)
+        frame.duration=[-1.,0.];frame.to_csv(self.events[0],sep='\t',index=False)
+        with self.assertRaisesRegex(ValueError,'Invalid event timing'):self.prepare(drop_invalid=True)
+
+    def test_drop_invalid_refuses_to_discard_an_entire_run(self):
+        frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[100.,200.]
+        frame.to_csv(self.events[0],sep='\t',index=False)
+        with self.assertRaisesRegex(ValueError,'No valid selected events'):self.prepare(drop_invalid=True)
+
+    def test_drop_invalid_export_records_exclusions_and_keeps_beta_alignment(self):
+        frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[100.,0.]
+        frame.to_csv(self.events[0],sep='\t',index=False)
+        results=self.fit_stub(drop_invalid=True)
+        folder=Path(results['typed'][0]).parent
+        manifest=pd.read_csv(folder/'model-typed_trial_manifest.tsv',sep='\t',dtype=str)
+        excluded=pd.read_csv(folder/'excluded_events.tsv',sep='\t',dtype=str)
+        provenance=json.loads((folder/'fit_provenance.json').read_text())
+        self.assertEqual(manifest.trial_type.tolist(),['CS','CS'])
+        self.assertEqual(len(results['typed']),2)
+        self.assertEqual(excluded.trial_type.tolist(),['US'])
+        self.assertTrue(provenance['drop_invalid'])
+        self.assertEqual(provenance['excluded_event_count'],1)
+        self.assertTrue((folder/'late_events.tsv').is_file())
+        self.assertTrue((folder/'run_summary.tsv').is_file())
+        self.assertIn(str((folder/'excluded_events.tsv').resolve()),[item['path'] for item in provenance['outputs']])
+
+    def test_reported_335_volume_128_event_case_keeps_118(self):
+        nib.save(nib.Nifti1Image(np.ones((2,2,2,335),dtype=np.float32),np.eye(4)),self.bold[0])
+        onsets=list(np.arange(118)*4.2)+[707.3591,713.3591,720.3738,726.3738,733.2999,739.2999,744.2328,750.2328,756.1507,762.1507]
+        pd.DataFrame(dict(onset=onsets,duration=[0.]*128,trial_type=['CS']*118+['outside']*10)).to_csv(self.events[0],sep='\t',index=False)
+        result=io.prepare_runs(self.bold,self.events,2.1,drop_invalid=True,return_diagnostics=True)
+        self.assertEqual(int(result[2][0].sum()),118)
+        self.assertEqual(len(result[-1]['excluded_events']),10)
+        self.assertNotIn('outside',result[4])
+        self.assertEqual(result[-1]['run_summary'].retained_events.tolist(),[118,1])
 
     def test_complete_export_and_existing_fit_guard(self):
         results=self.fit_stub()

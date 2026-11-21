@@ -33,8 +33,49 @@ def atomic_json(path, value):
             os.unlink(temporary)
 
 
+def validate_event_times(df, img, bold, events, tr, drop_invalid=False):
+    """Reject malformed timings; optionally exclude only out-of-grid onsets."""
+    onsets = pd.to_numeric(df.onset, errors='raise').to_numpy(float)
+    durations = pd.to_numeric(df.duration, errors='raise').to_numpy(float)
+    if not np.isfinite(onsets).all() or not np.isfinite(durations).all() or (durations < 0).any():
+        raise ValueError('Invalid event timing: ' + str(events))
+    volumes = np.rint(onsets / tr).astype(int)
+    invalid = (onsets < 0) | (volumes < 0) | (volumes >= img.shape[-1])
+    excluded = pd.DataFrame()
+    if invalid.any():
+        bad = df.loc[invalid, ['source_row', 'trial_type', 'onset', 'duration']].copy()
+        bad['tsv_line'] = bad.pop('source_row').astype(int) + 2
+        bad['design_volume'] = volumes[invalid]
+        acquisition_end = img.shape[-1] * tr
+        bad['reason'] = np.where(onsets[invalid] < 0, 'negative onset',
+            np.where(onsets[invalid] >= acquisition_end, 'onset beyond acquisition',
+                     'rounding beyond final design row'))
+        if not drop_invalid:
+            raise ValueError(
+                'Selected event outside acquired run/design grid.\n'
+                f'BOLD: {bold}\nEvents: {events}\n'
+                f'Volumes: {img.shape[-1]}; TR: {tr:g} s; acquisition span: [0, {acquisition_end:g}) s; '
+                f'last sampled time: {(img.shape[-1]-1)*tr:g} s; valid design indices: 0..{img.shape[-1]-1}.\n'
+                f'Invalid selected events: {len(bad)} of {len(df)} (first 10 shown):\n'
+                + bad.head(10).to_string(index=False)
+                + '\nCheck the BOLD/events match, TR, time origin and any removed volumes. '
+                  'No events were dropped or shifted and fitting has not started.')
+        excluded = df.loc[invalid].copy()
+        excluded['tsv_line'] = excluded['source_row'].astype(int) + 2
+        excluded['design_volume'] = volumes[invalid]
+        excluded['reason'] = bad['reason'].to_numpy()
+        df = df.loc[~invalid].copy()
+        volumes = volumes[~invalid]
+        if df.empty:
+            raise ValueError('No valid selected events remain after --drop-invalid: ' + str(events))
+    if len(np.unique(volumes)) != len(volumes):
+        raise ValueError('Selected events collide after onset-to-TR rounding: ' + str(events))
+    df = df.assign(design_volume=volumes).sort_values('design_volume', kind='stable')
+    return df, excluded
+
+
 def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration=0,
-                 event_durations=(), additional_confounds=()):
+                 event_durations=(), additional_confounds=(), drop_invalid=False, return_diagnostics=False):
     if not np.isfinite(tr) or tr <= 0 or not np.isfinite(stim_duration) or stim_duration < 0:
         raise ValueError('TR must be positive and stimulus duration must be nonnegative')
     if not bold_files or len(set(map(str, bold_files))) != len(bold_files):
@@ -71,7 +112,7 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
     streams = {tuple(tags.get(k, '') for k in ('sub','task','space','desc','acq','echo')) for _, _, tags in pairs}
     if len(streams) != 1:
         raise ValueError('GLMsingle inputs mix subjects, tasks, spaces or preprocessing streams')
-    frames = []
+    frames, excluded_frames, late_frames, run_summaries = [], [], [], []
     for bold, events, tags in pairs:
         df = pd.read_csv(events, sep='\t')
         if not {'onset','duration','trial_type'} <= set(df.columns):
@@ -83,6 +124,27 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
             df = df[df.trial_type.isin(include_trials)].copy()
         if df.empty:
             raise ValueError('No selected events for ' + str(events))
+        img = nib.load(str(bold))
+        if len(img.shape) != 4:
+            raise ValueError('Expected 4D BOLD: ' + str(bold))
+        n_selected = len(df)
+        df, excluded = validate_event_times(df, img, bold, events, tr, drop_invalid)
+        metadata = dict(subject=tags.get('sub',''), session=tags.get('ses',''), run=tags.get('run',''),
+                        bold_file=str(Path(bold).resolve()), events_file=str(Path(events).resolve()))
+        if not excluded.empty:
+            excluded_frames.append(excluded.assign(**metadata))
+        # This is a QC warning only: a late event is not automatically excluded.
+        remaining = img.shape[-1]*tr - df.onset.to_numpy(float)
+        late = df.loc[remaining < 16.].copy()
+        if not late.empty:
+            late['remaining_response_seconds'] = remaining[remaining < 16.]
+            late_frames.append(late.assign(**metadata))
+        run_summaries.append(dict(**metadata, n_volumes=img.shape[-1], tr=float(tr),
+                                 selected_events=n_selected, excluded_events=len(excluded), retained_events=len(df)))
+        if drop_invalid:
+            import logging
+            logging.getLogger(__name__).warning('Event selection for %s: selected=%d; excluded=%d; retained=%d',
+                                                bold, n_selected, len(excluded), len(df))
         frames.append(df)
     conditions = sorted({str(label) for df in frames for label in df.trial_type})
     for condition in conditions:
@@ -102,32 +164,6 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
         if shape is not None and (img.shape[:3] != shape or not np.allclose(img.affine, affine, rtol=0, atol=1e-5)):
             raise ValueError('BOLD grids differ across runs')
         shape, affine = img.shape[:3], img.affine
-        onsets = pd.to_numeric(df.onset, errors='raise').to_numpy(float)
-        durations = pd.to_numeric(df.duration, errors='raise').to_numpy(float)
-        if not np.isfinite(onsets).all() or not np.isfinite(durations).all() or (durations < 0).any():
-            raise ValueError('Invalid event timing: ' + str(events))
-        volumes = np.rint(onsets / tr).astype(int)
-        invalid = (onsets < 0) | (volumes < 0) | (volumes >= img.shape[-1])
-        if invalid.any():
-            bad = df.loc[invalid, ['source_row', 'trial_type', 'onset', 'duration']].copy()
-            bad['tsv_line'] = bad.pop('source_row').astype(int) + 2
-            bad['design_volume'] = volumes[invalid]
-            acquisition_end = img.shape[-1] * tr
-            bad['reason'] = np.where(onsets[invalid] < 0, 'negative onset',
-                np.where(onsets[invalid] >= acquisition_end, 'onset beyond acquisition',
-                         'rounding beyond final design row'))
-            raise ValueError(
-                'Selected event outside acquired run/design grid.\n'
-                f'BOLD: {bold}\nEvents: {events}\n'
-                f'Volumes: {img.shape[-1]}; TR: {tr:g} s; acquisition span: [0, {acquisition_end:g}) s; '
-                f'last sampled time: {(img.shape[-1]-1)*tr:g} s; valid design indices: 0..{img.shape[-1]-1}.\n'
-                f'Invalid selected events: {len(bad)} of {len(df)} (first 10 shown):\n'
-                + bad.head(10).to_string(index=False)
-                + '\nCheck the BOLD/events match, TR, time origin and any removed volumes. '
-                  'No events were dropped or shifted and fitting has not started.')
-        if len(np.unique(volumes)) != len(volumes):
-            raise ValueError('Selected events collide after onset-to-TR rounding: ' + str(events))
-        df = df.assign(design_volume=volumes).sort_values('design_volume', kind='stable')
         design = np.zeros((img.shape[-1], len(conditions)), dtype=int)
         for _, row in df.iterrows():
             design[int(row.design_volume), conditions.index(str(row.trial_type))] = 1
@@ -161,17 +197,27 @@ def prepare_runs(bold_files, event_files, tr, include_trials=None, stim_duration
         if not np.isfinite(values).all():
             raise ValueError('BOLD contains non-finite values: ' + str(bold))
         data.append(values)
-    return pairs, data, designs, pd.DataFrame(trials), conditions, regressors, inputs
+    result = (pairs, data, designs, pd.DataFrame(trials), conditions, regressors, inputs)
+    if not return_diagnostics:
+        return result
+    empty_columns = ['source_row','tsv_line','trial_type','onset','duration','design_volume','reason',
+                     'subject','session','run','bold_file','events_file']
+    diagnostics = dict(
+        excluded_events=pd.concat(excluded_frames, ignore_index=True) if excluded_frames else pd.DataFrame(columns=empty_columns),
+        late_events=pd.concat(late_frames, ignore_index=True) if late_frames else pd.DataFrame(columns=[*empty_columns, 'remaining_response_seconds']),
+        run_summary=pd.DataFrame(run_summaries))
+    return (*result, diagnostics)
 
 
 def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=None,
-                  stim_duration=0, event_durations=(), additional_confounds=(), tags=None, params=None):
+                  stim_duration=0, event_durations=(), additional_confounds=(), tags=None, params=None, drop_invalid=False):
     from glmsingle.glmsingle import GLM_single
     from stglm import utils
     import importlib.metadata
     import fcntl
-    pairs, data, designs, trials, conditions, regressors, inputs = prepare_runs(
-        bold_files, event_files, tr, include_trials, stim_duration, event_durations, additional_confounds)
+    pairs, data, designs, trials, conditions, regressors, inputs, diagnostics = prepare_runs(
+        bold_files, event_files, tr, include_trials, stim_duration, event_durations, additional_confounds,
+        drop_invalid=drop_invalid, return_diagnostics=True)
     tags = pairs[0][2]
     stream = '_'.join(f'{key}-{tags[key]}' for key in ('task','space','desc','acq','echo') if tags.get(key))
     # Sessions may be fitted jointly; run_index disambiguates repeated run labels.
@@ -210,11 +256,20 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 if matrix.ndim != 2 or matrix.shape[0] != run_data.shape[-1] or not np.isfinite(matrix).all():
                     raise ValueError('extra_regressors must be finite time-by-regressor matrices')
                 extra_info.append(dict(shape=list(matrix.shape), sha256=hashlib.sha256(matrix.tobytes()).hexdigest()))
+        diagnostic_paths = []
+        for name, frame in diagnostics.items():
+            path = final / (name + '.tsv')
+            frame.to_csv(path, sep='\t', index=False)
+            diagnostic_paths.append(path)
+        if not diagnostics['late_events'].empty:
+            logging.getLogger(__name__).warning(
+                '%d retained events have less than 16 s of acquisition after onset; see %s',
+                len(diagnostics['late_events']), final/'late_events.tsv')
         GLM_single(params=copy.deepcopy(parameters)).fit(designs, data, stim_duration, tr,
             outputdir=str(final), figuredir=str(final/'figures'))
         models = {'typeb':'TYPEB_FITHRF.npy', 'typed':'TYPED_FITHRF_GLMDENOISE_RR.npy'}
         results = {}
-        outputs = []
+        outputs = [identity(path) for path in diagnostic_paths]
         for model, filename in models.items():
             raw = final / filename
             if not raw.is_file():
@@ -245,6 +300,8 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 raise ValueError('Input changed during GLMsingle fitting: ' + saved['path'])
         atomic_json(marker, dict(status='complete', fit_scope='joint_runs', inputs=inputs, outputs=outputs,
             conditions=conditions, tr=float(tr), stim_duration=float(stim_duration),
+            drop_invalid=bool(drop_invalid), excluded_event_count=len(diagnostics['excluded_events']),
+            late_event_warning_window_seconds=16., late_event_count=len(diagnostics['late_events']),
             parameters={key: value for key, value in requested_parameters.items() if key != 'extra_regressors'},
             extra_regressors=extra_info,
             run_order=[dict(bold=str(b), events=str(e), entities=t, n_volumes=values.shape[-1])
