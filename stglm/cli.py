@@ -62,6 +62,16 @@ def _find_bids_match(reference, candidates, label, required=True):
     return matches[0]
 
 
+def _run_number(value):
+    """Normalize a BIDS run index without accepting zero or nonnumeric labels."""
+    text = str(value)
+    if text.startswith('run-'):
+        text = text[4:]
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        raise ValueError('Run must be a positive BIDS index, e.g. 01 or run-01')
+    return int(text)
+
+
 def build_inputs(
     layout,
     subject,
@@ -74,6 +84,7 @@ def build_inputs(
     evs=None,
     glm_kws=None,
     gm_probseg_threshold=0.5,
+    runs=None,
     **kwargs,
 ):
     """Build run inputs and attach fMRIPrep GM probability maps.
@@ -82,6 +93,12 @@ def build_inputs(
     not normally emit it. It is computed later from each run's BOLD image.
     """
     glm_kws = dict(glm_kws or {})
+    selected_runs = None
+    if runs is not None:
+        selected_runs = sorted({_run_number(value) for value in runs})
+        if not selected_runs:
+            raise ValueError('Run selection must not be empty')
+        kwargs = dict(kwargs, run=selected_runs)
     if glm_single:
         no_confounds = True
 
@@ -91,6 +108,35 @@ def build_inputs(
     )
     if not bold_files:
         raise FileNotFoundError(f"No bold files found for sub-{subject}")
+    if selected_runs is not None:
+        found_runs = {_run_number(item.entities['run']) for item in bold_files if item.entities.get('run') is not None}
+        missing_runs = sorted(set(selected_runs) - found_runs)
+        if missing_runs:
+            raise FileNotFoundError(f'Requested BOLD runs missing for sub-{subject}: {missing_runs}')
+        logger.info('Selected BOLD runs for sub-%s: %s', subject, selected_runs)
+
+    # Exclude unmatched runs before reading TR, building QC inputs or fitting.
+    # Ambiguous matches still raise: they cannot be resolved by dropping data.
+    events = layout.get(
+        subject=subject, task=task, suffix="events", extension="tsv",
+        return_type="object"
+    )
+    paired_bold = []
+    paired_events = []
+    for bold in bold_files:
+        event = _find_bids_match(bold, events, 'events', required=False)
+        if event is None:
+            logger.warning('Skipping BOLD run without matching events: %s', bold.path)
+        else:
+            paired_bold.append(bold)
+            paired_events.append(event)
+    if not paired_bold:
+        raise FileNotFoundError(f'No BOLD runs with matching events remain for sub-{subject}')
+    if len(paired_bold) != len(bold_files):
+        logger.warning('sub-%s: retained %d/%d BOLD runs after events matching',
+                       subject, len(paired_bold), len(bold_files))
+    bold_files = paired_bold
+    events = paired_events
 
     mask_files = layout.get(
         subject=subject, task=task, suffix="mask", extension="nii.gz",
@@ -107,14 +153,8 @@ def build_inputs(
         )
         if not confounds:
             raise FileNotFoundError(f"No confounds found for sub-{subject}")
+        confounds = [_find_bids_match(bold, confounds, 'confounds') for bold in bold_files]
         logger.info("Found %d files with suffix='%s'", len(confounds), confounds_suffix)
-
-    events = layout.get(
-        subject=subject, task=task, suffix="events", extension="tsv",
-        return_type="object"
-    )
-    if not events:
-        raise FileNotFoundError(f"No events found for sub-{subject}")
 
     # fMRIPrep/sMRIPrep normally provides label-GM_probseg in anatomical or
     # standard space. The QC helper resamples it to each BOLD/tSNR grid.
@@ -139,7 +179,7 @@ def build_inputs(
         raise ValueError(f"RepetitionTime is unavailable for {bold_files[0].path}")
 
     if glm_single:
-        matched_events = [_find_bids_match(bold, events, "events") for bold in bold_files]
+        matched_events = events
         for bold in bold_files:
             run_tr = layout.get_metadata(bold.path).get("RepetitionTime", tr)
             if not np.isclose(float(run_tr), float(tr), rtol=0, atol=1e-5):
@@ -200,11 +240,9 @@ def build_inputs(
     logger.info("Estimation mode = loop; performing run-wise trial estimation")
     all_runs = []
     for index, bold_file in enumerate(bold_files, start=1):
-        event_file = _find_bids_match(bold_file, events, "events file")
+        event_file = events[index-1]
         mask_file = _find_bids_match(bold_file, mask_files, "mask")
-        confound_file = _find_bids_match(
-            bold_file, confounds, "confounds file", required=not no_confounds
-        )
+        confound_file = None if no_confounds else confounds[index-1]
         gm_probseg = _find_bids_match(bold_file, gm_probsegs, "GM probability map")
         metadata = layout.get_metadata(bold_file.path)
         run_tr = bold_file.entities.get("RepetitionTime") or metadata.get("RepetitionTime") or tr
@@ -506,6 +544,11 @@ For more custom implementation, this package might not be for you.
     )
 
     parser.add_argument(
+        '--run', '--runs', dest='runs', nargs='+', type=_run_number,
+        help='Select BIDS run indices before events matching, e.g. --run 01 03 04. Default: all runs'
+    )
+
+    parser.add_argument(
         '--run-mode', 
         choices=['loop', 'concat'],
         default='loop',
@@ -683,6 +726,7 @@ def main():
         glm_kws=glm_kws,
         evs=args.evs,
         gm_probseg_threshold=args.gm_threshold,
+        runs=args.runs,
         **space_kwargs
     )
 
