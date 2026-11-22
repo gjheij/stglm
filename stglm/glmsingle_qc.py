@@ -97,7 +97,8 @@ def build_run_metadata(pairs, qc_runs, folder, additional_confounds=(),
         request=dict(inputs=inputs,settings=settings,metadata=upstream,additional_confounds=extra_sources)
         signature=hashlib.sha256(json.dumps(request,sort_keys=True,default=str).encode()).hexdigest()
         prefix='_'.join(f'{key}-{tags[key]}' for key in ('sub','ses','task','acq','run','echo','space','desc') if tags.get(key))
-        tsnr=folder/(prefix+'_stat-tsnr_statmap.nii.gz')
+        tsnr=folder/(prefix+'_stat-tsnr_boldmap.nii.gz')
+        tsnr_sidecar=folder/(prefix+'_stat-tsnr_boldmap.json')
         sidecar=folder/(prefix+'_qc.json');cache=folder/(prefix+'_qc.provenance.json')
         tsnr_request=dict(bold=file_identity(bold),regress_poly=int(regress_poly),
                           algorithm=settings['algorithm'],numpy=np.__version__,nibabel=nib.__version__,
@@ -115,7 +116,9 @@ def build_run_metadata(pairs, qc_runs, folder, additional_confounds=(),
                 pass
         if cached is not None:
             logger.info('Reusing run QC: %s',prefix)
-            metadata[index]=cached;outputs.extend([tsnr,sidecar,cache]);continue
+            if not tsnr_sidecar.is_file():
+                _save_json(tsnr_sidecar,cached)
+            metadata[index]=cached;outputs.extend([tsnr,tsnr_sidecar,sidecar,cache]);continue
         logger.info('Computing run QC: %s',prefix)
         if not tsnr_valid:
             streaming_tsnr(bold,tsnr,int(regress_poly))
@@ -150,13 +153,14 @@ def build_run_metadata(pairs, qc_runs, folder, additional_confounds=(),
                     GMThreshold=float(gm_threshold),QCStatus='partial' if issues else 'complete',QCIssues=issues,
                     QCSources={key:run.get(key) for key in ('mask','gm_probseg','fd_confounds')})
         _save_json(sidecar,base)
+        _save_json(tsnr_sidecar,base)
         for item in inputs:
             if file_identity(item['path'])!=item:
                 raise ValueError('QC input changed during computation: ' + item['path'])
         _save_json(cache,dict(signature=signature,inputs=inputs,settings=settings,
                               tsnr_signature=tsnr_signature,tsnr_identity=file_identity(tsnr),
-                              outputs=[file_identity(path) for path in (tsnr,sidecar)]))
-        metadata[index]=base;outputs.extend([tsnr,sidecar,cache])
+                              outputs=[file_identity(path) for path in (tsnr,tsnr_sidecar,sidecar)]))
+        metadata[index]=base;outputs.extend([tsnr,tsnr_sidecar,sidecar,cache])
         for issue in issues:logger.warning('%s: %s',prefix,issue)
     metrics=folder/'run_metrics.tsv'
     records=[]

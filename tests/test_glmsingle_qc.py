@@ -85,6 +85,9 @@ class QC(unittest.TestCase):
         self.assertEqual(base['TSNRRegressPoly'],2)
         self.assertTrue((self.folder/'qc/run_metrics.tsv').is_file())
         self.assertTrue(all(Path(path).is_file() for path in outputs))
+        tsnr=Path(base['TSNRFile'])
+        self.assertTrue(tsnr.name.endswith('_stat-tsnr_boldmap.nii.gz'))
+        self.assertEqual(json.loads(tsnr.with_name(tsnr.name[:-7]+'.json').read_text()),base)
 
     def test_cache_reuses_map_and_invalidates_metrics_without_recomputing_tsnr(self):
         self.build()

@@ -267,7 +267,7 @@ class Runs(unittest.TestCase):
             self.assertEqual(metadata['ConfoundRegressors'],[])
             self.assertTrue(Path(metadata['TSNRFile']).is_file())
             self.assertTrue(metadata['Model']['GLMdenoise'])
-        self.assertEqual(len(list((folder/'qc').glob('*_stat-tsnr_statmap.nii.gz'))),2)
+        self.assertEqual(len(list((folder/'qc').glob('*_stat-tsnr_boldmap.nii.gz'))),2)
         self.assertTrue((folder.parent/('.'+folder.name+'.previous_export.json')).is_file())
         saved=json.loads((folder/'fit_provenance.json').read_text())
         self.assertEqual(saved['qc_status'],{'0':'complete','1':'complete'})
