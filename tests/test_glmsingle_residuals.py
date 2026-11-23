@@ -149,6 +149,19 @@ class Residuals(unittest.TestCase):
             pair = [nib.load(path).get_fdata() for path in images if f'run-{run}' in path.name]
             np.testing.assert_allclose(pair[0], pair[1], atol=1e-6)
 
+    def test_bold_buffer_is_contiguous_by_volume(self):
+        original = np.memmap
+        buffers = []
+        def memmap(path, **kwargs):
+            value = original(path, **kwargs)
+            if Path(path).name == 'bold.dat':
+                self.assertTrue(value[:, 0].flags.c_contiguous)
+                buffers.append(kwargs.get('order'))
+            return value
+        with patch.object(res.np, 'memmap', side_effect=memmap):
+            res.export_type_d_residuals(self.fit, self.info, self.bold, self.root/'order')
+        self.assertEqual(buffers, ['F', 'F'])
+
     def test_dependent_nuisance_columns_use_rank(self):
         self.info['params']['extra_regressors'] = [np.column_stack([value, value, np.ones(len(value))]) for value in self.extra]
         files = res.export_type_d_residuals(self.fit, self.info, self.bold, self.root/'dependent')

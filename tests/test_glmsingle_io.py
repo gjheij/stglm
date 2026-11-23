@@ -141,9 +141,19 @@ class Runs(unittest.TestCase):
             path.write_text('{}')
             return [path]
         stub.export_type_d_residuals = export
+        existing = {path: path.stat().st_mtime_ns for path in folder.rglob('*')
+                    if path.is_file() and path.name != 'fit_provenance.json'}
         with patch.dict(sys.modules, {'stglm.glmsingle_residuals': stub}):
-            self.fit_stub(export_only=True, export_residuals=True, residual_units='input', residual_chunk_voxels=3)
+            original_load = np.load
+            def load(path, *args, **kwargs):
+                if Path(path).name == 'TYPEB_FITHRF.npy':
+                    raise AssertionError('Residual-only recovery must not load TYPE-B')
+                return original_load(path, *args, **kwargs)
+            with patch.object(io, 'export_conditionwise', side_effect=AssertionError('Unnecessary beta re-export')):
+                with patch.object(io.np, 'load', side_effect=load):
+                    self.fit_stub(export_only=True, export_residuals=True, residual_units='input', residual_chunk_voxels=3)
         self.assertEqual(self.engine_calls, calls)
+        self.assertTrue(all(path.stat().st_mtime_ns == stamp for path, stamp in existing.items()))
         marker = json.loads((folder/'fit_provenance.json').read_text())
         path = folder/'residuals/model-typed/test.json'
         self.assertIn(str(path.resolve()), [item['path'] for item in marker['outputs']])

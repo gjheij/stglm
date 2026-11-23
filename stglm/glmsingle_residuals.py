@@ -43,19 +43,25 @@ ranks only as diagnostics. Do not pass those ranks as ridge residual DOF to RSA.
 
 Memory is bounded by a voxel block and a few time-by-regressor matrices beyond
 the already-loaded model dictionary. Each BOLD run is read once, volume by
-volume, into a temporary disk-backed array. Residual work arrays are also
+volume, into a Fortran-ordered disk-backed array so each volume write is
+contiguous. Residual work arrays remain C-ordered for contiguous voxel blocks.
+Buffering, reconstruction and image writing have separate timing messages.
+Residual work arrays are also
 disk-backed, runs are processed sequentially, and NIfTIs are atomically
 published only after validation. Temporary data are removed on exit.
 """
 import hashlib
-import logging
 from pathlib import Path
 import tempfile
+from time import monotonic
 
 import nibabel as nib
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from .logger import get_logger
+
+logger = get_logger(__name__)
+logger.setLevel('INFO')
 
 
 def _basis(matrix):
@@ -207,12 +213,31 @@ def export_type_d_residuals(fit, design_info, bold_files, output_dir,
         task_cache = {}
         with tempfile.TemporaryDirectory(prefix='.reconstruct-', dir=folder) as temporary:
             temporary = Path(temporary)
-            data = np.memmap(temporary/'bold.dat', mode='w+', dtype='float32', shape=(n_voxels, n_time))
+            started = monotonic()
+            logger.info('Buffering BOLD: run %d/%d; %d volumes; %.2f GiB; contiguous volume writes',
+                        run_index+1, count, n_time, n_voxels*n_time*4/2**30)
+            data = np.memmap(temporary/'bold.dat', mode='w+', dtype='float32',
+                             shape=(n_voxels, n_time), order='F')
+            next_message = started + 60
             for time in range(n_time):
                 data[:, time] = np.asarray(image.dataobj[..., time], dtype=np.float32).reshape(-1)
+                now = monotonic()
+                if now >= next_message:
+                    logger.info('Buffering BOLD: run %d; volume %d/%d; elapsed %.1f s',
+                                run_index+1, time+1, n_time, now-started)
+                    next_message = now+60
+            logger.info('BOLD buffering finished: run %d; elapsed %.1f s',
+                        run_index+1, monotonic()-started)
+            reconstruct_started = monotonic()
+            next_message = reconstruct_started+60
             arrays = {kind: np.memmap(temporary/(kind+'.dat'), mode='w+', dtype='float32', shape=(n_voxels, n_time))
                       for kind in ('taskpoly', 'fullnuisance')}
             for start in range(0, n_voxels, voxel_chunk):
+                now = monotonic()
+                if now >= next_message:
+                    logger.info('Reconstructing: run %d; voxel %d/%d; elapsed %.1f s',
+                                run_index+1, start, n_voxels, now-reconstruct_started)
+                    next_message = now+60
                 stop = min(n_voxels, start+voxel_chunk)
                 block_betas = np.asarray(betas[start:stop], dtype=float)
                 block_valid = valid[start:stop].copy()
@@ -263,6 +288,8 @@ def export_type_d_residuals(fit, design_info, bold_files, output_dir,
                                  f'maximum error={max_error:.6g} percentage points; tolerance={r2_atol}')
             logger.info('Residual R2run validation passed: run %d; valid=%d; excluded=%d; maximum error=%.6g percentage points',
                         run_index+1, valid.sum(), (~valid).sum(), max_error)
+            logger.info('Reconstruction finished: run %d; elapsed %.1f s',
+                        run_index+1, monotonic()-reconstruct_started)
             mask = folder/(prefix+'_model-typed_desc-residualvalid_mask.nii.gz')
             base = dict(Model='GLMsingleTYPED', RunIndex=run_index, Sources=[identity(bold)],
                         ReconstructionMethod='typed-inverse-autoscale-projection-v1',
@@ -284,6 +311,8 @@ def export_type_d_residuals(fit, design_info, bold_files, output_dir,
                                           DetrendedVarianceFloor='64 * eps(float32)^2 * sum(input_BOLD^2)'),
                         TemporalWhitening=False, TaskSignalMayRemain=True)
             for kind, array in arrays.items():
+                writing_started = monotonic()
+                logger.info('Writing residual NIfTI: run %d; definition=%s', run_index+1, kind)
                 array.flush()
                 name = prefix + f'_model-typed_desc-{kind}_residuals'
                 path = folder/(name+'.nii.gz')
@@ -295,6 +324,8 @@ def export_type_d_residuals(fit, design_info, bold_files, output_dir,
                 sidecar = folder/(name+'.json')
                 atomic_json(sidecar, dict(base, ResidualDefinition=kind))
                 outputs.extend([path, sidecar])
+                logger.info('Residual NIfTI finished: %s; elapsed %.1f s', path,
+                            monotonic()-writing_started)
             staged_mask = temporary/mask.name
             nib.save(nib.Nifti1Image(valid.reshape(spatial).astype('uint8'), image.affine), staged_mask)
             staged_mask.replace(mask)

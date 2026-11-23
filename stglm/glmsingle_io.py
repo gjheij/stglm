@@ -406,6 +406,33 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
                 # halfway through. Raw fits and the previous provenance survive.
                 atomic_json(final.parent/('.'+final.name+'.previous_export.json'),previous)
                 marker.unlink()
+                # Add residuals to an otherwise completed export without loading
+                # TYPE-B, rerunning QC, or rewriting large condition-wise betas.
+                if export_residuals and (not split_trial_types or (final/'conditionwise').is_dir()):
+                    from stglm.glmsingle_residuals import export_type_d_residuals
+                    from stglm.logger import get_logger
+                    log = get_logger(__name__)
+                    log.info('Residual-only recovery: keeping existing beta exports and QC unchanged')
+                    typed_path = final/'TYPED_FITHRF_GLMDENOISE_RR.npy'
+                    log.info('Loading TYPE-D model: %s', typed_path)
+                    fitted = np.load(typed_path, allow_pickle=True).item()
+                    residual_files = export_type_d_residuals(
+                        fitted, np.load(final/'DESIGNINFO.npy', allow_pickle=True).item(),
+                        [bold for bold,_,_ in pairs], final, units=residual_units,
+                        voxel_chunk=residual_chunk_voxels)
+                    del fitted
+                    for saved in inputs:
+                        if identity(saved['path']) != saved:
+                            raise ValueError('Input changed during residual reconstruction: '+saved['path'])
+                    updated = copy.deepcopy(previous)
+                    updated['outputs'] = [item for item in previous['outputs']
+                        if not Path(item['path']).is_relative_to((final/'residuals').resolve())]
+                    updated['outputs'].extend(identity(path) for path in residual_files)
+                    updated['residual_export'] = dict(enabled=True, units=residual_units,
+                        voxel_chunk=int(residual_chunk_voxels), recovery='residual_only')
+                    atomic_json(marker, updated)
+                    return {model: list(map(str, sorted(final.glob(f'model-{model}_beta-*.nii.gz'))))
+                            for model in ('typeb','typed') if (final/f'model-{model}_trial_manifest.tsv').is_file()}
         else:
             atomic_json(plan_path, plan)
             if not diagnostics['late_events'].empty:
