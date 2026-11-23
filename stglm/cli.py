@@ -622,6 +622,12 @@ For more custom implementation, this package might not be for you.
         help='Export existing GLMsingle models without fitting; verify DESIGNINFO and any saved input plan')
     parser.add_argument('--split-trial-types', action='store_true',
         help='Also export per-run/condition 4D trial beta images with JSON and TSV metadata')
+    parser.add_argument('--export-residuals', action='store_true',
+        help='Reconstruct TYPE-D taskpoly/fullnuisance residuals per run; compatible with --export-only')
+    parser.add_argument('--residual-units', choices=['beta', 'input'], default='beta',
+        help='Residual voxel scaling: saved TYPE-D beta-compatible (default), or original BOLD units')
+    parser.add_argument('--residual-chunk-voxels', type=int, default=2048,
+        help='Voxel block size for disk-backed residual reconstruction (default: 2048)')
     parser.add_argument('--drop-invalid', action='store_true',
         help='Exclude out-of-grid events and events with less than 8 s after the rounded onset; save excluded_events.tsv without shifting timing')
     parser.add_argument('--event-duration', action='append', default=[], metavar='PATTERN=SECONDS',
@@ -693,7 +699,9 @@ def main():
     )
 
     run_glmsingle = args.glm_single
-    if not run_glmsingle and (args.event_duration or args.additional_confounds or args.drop_invalid or args.export_only or args.split_trial_types):
+    if args.residual_chunk_voxels < 1:
+        raise ValueError('--residual-chunk-voxels must be positive')
+    if not run_glmsingle and (args.event_duration or args.additional_confounds or args.drop_invalid or args.export_only or args.split_trial_types or args.export_residuals):
         raise ValueError("GLMsingle event/confound/export options require --glm-single")
     if args.deriv_dir is None:
         if run_glmsingle:
@@ -831,6 +839,8 @@ def main():
             **runs, event_durations=args.event_duration,
             additional_confounds=args.additional_confounds, drop_invalid=args.drop_invalid,
             export_only=args.export_only, split_trial_types=args.split_trial_types,
+            export_residuals=args.export_residuals, residual_units=args.residual_units,
+            residual_chunk_voxels=args.residual_chunk_voxels,
             fd_threshold=args.fd_threshold, gm_threshold=args.gm_threshold,
             tsnr_regress_poly=args.tsnr_regress_poly,
         )

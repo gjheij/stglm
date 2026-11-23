@@ -127,6 +127,32 @@ class Runs(unittest.TestCase):
         with patch.dict(sys.modules,{'glmsingle':parent,'glmsingle.glmsingle':engine_module,'stglm':package}):
             return io.fit_glmsingle(self.bold,self.events,2.,output_dir=self.root/'output',params={'wantfileoutputs':[1,1,1,1]}, **kwargs)
 
+    def test_residual_export_reuses_completed_fit_and_stays_in_manifest(self):
+        result = self.fit_stub()
+        calls = self.engine_calls
+        folder = Path(result['typed'][0]).parent
+        stub = types.ModuleType('stglm.glmsingle_residuals')
+        def export(fitted, info, bold, target, **kwargs):
+            self.assertEqual(kwargs['units'], 'input')
+            self.assertEqual(kwargs['voxel_chunk'], 3)
+            self.assertEqual(list(bold), list(self.bold))
+            path = Path(target)/'residuals/model-typed/test.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{}')
+            return [path]
+        stub.export_type_d_residuals = export
+        with patch.dict(sys.modules, {'stglm.glmsingle_residuals': stub}):
+            self.fit_stub(export_only=True, export_residuals=True, residual_units='input', residual_chunk_voxels=3)
+        self.assertEqual(self.engine_calls, calls)
+        marker = json.loads((folder/'fit_provenance.json').read_text())
+        path = folder/'residuals/model-typed/test.json'
+        self.assertIn(str(path.resolve()), [item['path'] for item in marker['outputs']])
+        self.fit_stub(export_only=True)
+        marker = json.loads((folder/'fit_provenance.json').read_text())
+        self.assertEqual(marker['residual_export']['units'], 'input')
+        self.assertTrue(marker['residual_export']['enabled'])
+        self.assertIn(str(path.resolve()), [item['path'] for item in marker['outputs']])
+
     def test_drop_invalid_excludes_only_bad_rows_and_rebuilds_conditions(self):
         frame=pd.read_csv(self.events[0],sep='\t');frame.onset=[100.,0.]
         frame.to_csv(self.events[0],sep='\t',index=False)

@@ -311,7 +311,17 @@ def export_conditionwise(betas, reference, folder, model, trials, run_order, tr,
 def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=None,
                   stim_duration=0, event_durations=(), additional_confounds=(), tags=None, params=None, drop_invalid=False,
                   export_only=False, split_trial_types=False, qc_runs=None,
-                  fd_threshold=.2, gm_threshold=.5, tsnr_regress_poly=2):
+                  fd_threshold=.2, gm_threshold=.5, tsnr_regress_poly=2,
+                  export_residuals=False, residual_units='beta', residual_chunk_voxels=2048):
+    """Fit/recover GLMsingle and optionally reconstruct TYPE-D residuals.
+
+    ``export_only=True, export_residuals=True`` uses completed models without
+    invoking GLM_single.fit. Reconstruction, unit conversion, nuisance handling,
+    validation and ridge-DOF limitations are documented in
+    ``glmsingle_residuals.export_type_d_residuals`` and its module docstring.
+    """
+    if export_residuals and (residual_units not in ('beta', 'input') or residual_chunk_voxels < 1):
+        raise ValueError('Invalid residual units or voxel chunk')
     from glmsingle.glmsingle import GLM_single
     from stglm import utils
     import importlib.metadata
@@ -437,9 +447,19 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
         actual_parameters=np.load(design_info,allow_pickle=True).item()['params'] if design_info.is_file() else requested_parameters
         actual_parameters=dict(actual_parameters)
         actual_parameters['ExtraRegressorsByRun']=extra_info
+        if export_residuals and not (final/'TYPED_FITHRF_GLMDENOISE_RR.npy').is_file():
+            raise ValueError('TYPE-D model is required for residual reconstruction')
         models = {'typeb':'TYPEB_FITHRF.npy', 'typed':'TYPED_FITHRF_GLMDENOISE_RR.npy'}
         results = {}
         outputs = [identity(path) for path in diagnostic_paths+qc_outputs]
+        # A later metadata/condition export must not drop existing residual
+        # products from the completion manifest when no new residuals are requested.
+        residual_record = dict(enabled=bool(export_residuals), units=residual_units,
+                               voxel_chunk=int(residual_chunk_voxels))
+        if completed_export and not export_residuals and previous.get('residual_export', {}).get('enabled'):
+            outputs.extend(item for item in previous['outputs']
+                           if Path(item['path']).is_relative_to((final/'residuals').resolve()))
+            residual_record = previous['residual_export']
         for model, filename in models.items():
             raw = final / filename
             if not raw.is_file():
@@ -447,6 +467,13 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
             fitted = np.load(raw, allow_pickle=True).item()
             if fitted['betasmd'].shape != (*spatial_shape, len(trials)):
                 raise ValueError('GLMsingle beta dimensions differ from the modeled trial table')
+            if export_residuals and model == 'typed':
+                from stglm.glmsingle_residuals import export_type_d_residuals
+                residual_files = export_type_d_residuals(
+                    fitted, np.load(design_info, allow_pickle=True).item(),
+                    [bold for bold,_,_ in pairs], final, units=residual_units,
+                    voxel_chunk=residual_chunk_voxels)
+                outputs.extend(identity(path) for path in residual_files)
             if not completed_export:
                 utils.save_glmsingle_outputs(fitted, pairs[0][0], str(final), prefix='model-'+model)
             model_run_metadata = run_metadata
@@ -500,6 +527,7 @@ def fit_glmsingle(bold_files, event_files, tr, include_trials=None, output_dir=N
             run_order=run_order, versions=versions,
             export_only=bool(export_only), recovery_validation=recovery_validation,
             split_trial_types=bool(split_trial_types), qc_inputs=qc_inputs,
+            residual_export=residual_record,
             qc_settings=dict(fd_threshold=float(fd_threshold),gm_threshold=float(gm_threshold),
                              tsnr_regress_poly=int(tsnr_regress_poly)),
             qc_status={str(index):meta['QCStatus'] for index,meta in run_metadata.items()}, input_plan=str(plan_path) if plan_path.is_file() else None))
